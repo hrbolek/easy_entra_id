@@ -1,0 +1,17 @@
+services:
+  whoami:
+    image: traefik/whoami
+
+    ports:
+      - "8080:80"
+
+
+  easy_entra_id:
+    build: .
+    container_name: easy_entra_id
+    ports:
+      - "8088:8000"
+    volumes:
+      - .:/app
+    environment:
+      - TARGET_SERVER=http://whoami
