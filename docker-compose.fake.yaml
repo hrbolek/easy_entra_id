@@ -1,0 +1,21 @@
+services:
+  whoami:
+    image: traefik/whoami
+    ports:
+      - "8080:80"
+
+  fake_easy_entra_id:
+    build:
+      context: ./fake
+    container_name: fake_easy_entra_id
+    ports:
+      - "8088:8000"
+    volumes:
+      - ./fake:/app
+    environment:
+      - TARGET_SERVER=http://whoami
+      - FAKE_USERS_JSON=/app/fake_users.json
+      - FAKE_LOGIN_HTML_PATH=/app/index.html
+      - FAKE_AUTH_COOKIE=fake_easy_entra_user
+    depends_on:
+      - whoami

@@ -1,0 +1,23 @@
+[
+    {
+        "id": "97c80a87-8206-4845-98df-2af25ed33916",
+        "oid": "97c80a87-8206-4845-98df-2af25ed33916",
+        "email": "john.newbie@world.com",
+        "name": "John Newbie",
+        "roles": ["student", "user"]
+    },
+    {
+        "id": "b06d811c-6945-4c74-bbc7-0222537d2e13",
+        "oid": "b06d811c-6945-4c74-bbc7-0222537d2e13",
+        "email": "planner.admin@world.com",
+        "name": "Planner Admin",
+        "roles": ["plánovací administrátor", "user"]
+    },
+    {
+        "id": "7c03699a-f3c2-48b5-854f-8302c47145c9",
+        "oid": "7c03699a-f3c2-48b5-854f-8302c47145c9",
+        "email": "auditor@world.com",
+        "name": "Auditor",
+        "roles": ["auditor", "user"]
+    }
+]

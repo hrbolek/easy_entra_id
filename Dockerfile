@@ -1,7 +1,8 @@
 ###############################################################
 # Base stage: Python + system deps + pip install
 ###############################################################
-FROM python:3.13-alpine AS pythonbase
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+FROM ${PYTHON_IMAGE} AS pythonbase
 
 # Základní systémové závislosti pro build některých Python balíků
 # (uvloop/httptools/cryptography, atd.)
@@ -33,7 +34,7 @@ RUN python -m pip install --no-cache-dir -r /app/requirements.txt
 ###############################################################
 # Final stage: aplikační kód + non-root user
 ###############################################################
-FROM python:3.13-alpine AS executepython
+FROM ${PYTHON_IMAGE} AS executepython
 
 # Runtime knihovny (menší set než v builderu)
 RUN apk add --no-cache \
