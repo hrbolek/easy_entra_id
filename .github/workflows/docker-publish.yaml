@@ -26,12 +26,12 @@ jobs:
       matrix:
         app:
           - name: easy-entra-id
-            image: ghcr.io/${{ github.repository }}
+            image: ghcr.io/${{ github.actor }}/${{ github.repository }}
             context: .
             dockerfile: ./Dockerfile
 
           - name: easy-entra-id-fake
-            image: ghcr.io/${{ github.repository }}-fake
+            image: ghcr.io/${{ github.actor }}/${{ github.repository }}-fake
             context: ./fake
             dockerfile: ./fake/Dockerfile
 
