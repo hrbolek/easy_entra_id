@@ -35,6 +35,11 @@ jobs:
             context: ./fake
             dockerfile: ./fake/Dockerfile
 
+          - name: auth-shield
+            image: ghcr.io/${{ github.repository }}-fake
+            context: ./auth_shield
+            dockerfile: ./auth_shield/Dockerfile
+
         base:
           - id: py3.12-bookworm
             python_image: python:3.12-slim-bookworm
