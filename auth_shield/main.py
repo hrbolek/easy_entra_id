@@ -126,13 +126,17 @@ SENSITIVE_HEADERS = {
     "x-ms-client-principal",
     "x-ms-client-principal-id",
     "x-ms-client-principal-name",
+    "x-shield-app",
+    "x-shield-principal-id",
+    "x-shield-principal-name",
+    "x-shield-expires-in",
+    "x-shield-token-fingerprint",
 }
 
 EASYAUTH_MARKER_HEADERS = {
     "x-ms-client-principal",
     "x-ms-client-principal-id",
     "x-ms-client-principal-name",
-    "x-ms-token-aad-access-token",
 }
 
 SHIELD_TOKEN_PREFIX = "shld_"
@@ -296,7 +300,7 @@ def create_application_registry() -> dict[str, ApplicationRegistration]:
 
 @dataclass(slots=True)
 class VaultEntry:
-    entra_token: str
+    principal: str
     app_id: str
     principal_id: str
     principal_name: str | None
@@ -314,7 +318,7 @@ class TokenVault:
     async def issue(
         self,
         *,
-        entra_token: str,
+        principal: str,
         app_id: str,
         principal_id: str,
         principal_name: str | None,
@@ -323,13 +327,13 @@ class TokenVault:
         now = time.monotonic()
 
         entry = VaultEntry(
-            entra_token=entra_token,
+            principal=principal,
             app_id=app_id,
             principal_id=principal_id,
             principal_name=principal_name,
             expires_at=now + self.ttl_seconds,
             fingerprint=hashlib.sha256(
-                entra_token.encode("utf-8")
+                principal.encode("utf-8")
             ).hexdigest()[:16],
         )
 
@@ -402,7 +406,7 @@ def runtime_state(request: Request) -> AppState:
 
 @dataclass(frozen=True, slots=True)
 class EasyAuthIdentity:
-    entra_token: str
+    principal: str
     principal_id: str
     principal_name: str | None
 
@@ -479,28 +483,30 @@ def has_easyauth_markers(request: Request) -> bool:
 
 def extract_easyauth_identity(request: Request) -> EasyAuthIdentity:
     """
-    Validate the EasyEntraID / EasyAuth contract.
+    Validate the EasyEntraID identity contract.
 
-    Missing or malformed contract data is a gateway/infrastructure failure,
-    not a normal user-authentication failure, therefore HTTP 500 is returned.
+    Expected EasyEntraID headers:
+      - x-ms-client-principal
+      - x-ms-client-principal-id
+      - x-ms-client-principal-name (optional)
+
+    x-ms-client-principal is a Base64 encoded JSON principal and is the
+    authoritative identity payload stored in the Shield vault.
+
+    Missing or malformed contract data is treated as an infrastructure /
+    gateway failure and therefore returns HTTP 500.
     """
-    authorization_token = bearer(request.headers.get("authorization"))
-    easyauth_token = request.headers.get("x-ms-token-aad-access-token")
-
-    entra_token = easyauth_token or authorization_token
-
-    principal = decode_client_principal(
-        request.headers.get("x-ms-client-principal")
-    )
+    principal_b64 = request.headers.get("x-ms-client-principal")
+    principal = decode_client_principal(principal_b64)
 
     principal_id = (
         request.headers.get("x-ms-client-principal-id")
         or claim_from_client_principal(
             principal,
             "oid",
+            "sub",
             "objectidentifier",
             "http://schemas.microsoft.com/identity/claims/objectidentifier",
-            "sub",
         )
     )
 
@@ -509,6 +515,7 @@ def extract_easyauth_identity(request: Request) -> EasyAuthIdentity:
         or claim_from_client_principal(
             principal,
             "preferred_username",
+            "unique_name",
             "name",
             "email",
             "upn",
@@ -516,29 +523,27 @@ def extract_easyauth_identity(request: Request) -> EasyAuthIdentity:
         )
     )
 
-    missing: list[str] = []
+    problems: list[str] = []
 
-    if not entra_token:
-        missing.append(
-            "Authorization: Bearer <token> or "
-            "X-MS-TOKEN-AAD-ACCESS-TOKEN"
-        )
+    if not principal_b64:
+        problems.append("x-ms-client-principal")
+    elif principal is None:
+        problems.append("valid x-ms-client-principal")
 
     if not principal_id:
-        missing.append(
-            "X-MS-CLIENT-PRINCIPAL-ID or principal claim oid/sub"
+        problems.append(
+            "x-ms-client-principal-id or principal claim oid/sub"
         )
 
-    if missing:
+    if problems:
         request_id = request.headers.get(
             "x-request-id",
             secrets.token_hex(16),
         )
 
         logger.critical(
-            "EasyAuth gateway contract failure; missing=%s path=%s "
-            "request_id=%s",
-            missing,
+            "EasyEntraID contract failure; problems=%s path=%s request_id=%s",
+            problems,
             request.url.path,
             request_id,
         )
@@ -546,17 +551,21 @@ def extract_easyauth_identity(request: Request) -> EasyAuthIdentity:
         raise HTTPException(
             status_code=500,
             detail={
-                "message": "Authentication gateway contract failure",
-                "missing": missing,
+                "message": "EasyEntraID authentication contract failure",
+                "problems": problems,
                 "request_id": request_id,
             },
         )
 
+    assert principal_b64 is not None
+    assert principal_id is not None
+
     return EasyAuthIdentity(
-        entra_token=entra_token,
+        principal=principal_b64,
         principal_id=principal_id,
         principal_name=principal_name,
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +746,7 @@ async def handle_external_request(
         )
 
     handle = await state.vault.issue(
-        entra_token=identity.entra_token,
+        principal=identity.principal,
         app_id=registration.app_id,
         principal_id=identity.principal_id,
         principal_name=identity.principal_name,
@@ -807,7 +816,14 @@ async def handle_internal_request(
         urlsplit(state.settings.corridor_upstream).netloc,
     )
 
-    headers["authorization"] = f"Bearer {entry.entra_token}"
+    # Restore the EasyEntraID identity contract only at the trusted
+    # corridor boundary.
+    headers["x-ms-client-principal"] = entry.principal
+    headers["x-ms-client-principal-id"] = entry.principal_id
+
+    if entry.principal_name:
+        headers["x-ms-client-principal-name"] = entry.principal_name
+
     headers["x-shield-app"] = entry.app_id
     headers["x-shield-principal-id"] = entry.principal_id
     headers["x-shield-token-fingerprint"] = entry.fingerprint

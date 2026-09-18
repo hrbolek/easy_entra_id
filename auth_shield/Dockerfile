@@ -66,4 +66,4 @@ EXPOSE 8000
 
 # DŮLEŽITÉ:
 # TokenVault je process-local, proto musí běžet právě jeden worker.
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--timeout", "60", "--worker-class", "uvicorn.workers.UvicornWorker", "main:app"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
