@@ -15,10 +15,10 @@ COPY main.py /app/main.py
 COPY index.html /app/index.html
 COPY fake_users.json /app/fake_users.json
 
-ENV TARGET_SERVER=http://frontend:8000
-ENV FAKE_USERS_JSON=/app/fake_users.json
-ENV FAKE_LOGIN_HTML_PATH=/app/index.html
-ENV FAKE_AUTH_COOKIE=fake_easy_entra_user
+# ENV TARGET_SERVER=http://frontend:8000
+# ENV FAKE_USERS_JSON=/app/fake_users.json
+# ENV FAKE_LOGIN_HTML_PATH=/app/index.html
+# ENV FAKE_AUTH_COOKIE=fake_easy_entra_user
 
 EXPOSE 8000
 

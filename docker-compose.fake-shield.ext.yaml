@@ -1,0 +1,86 @@
+services:
+  whoami:
+    image: traefik/whoami
+    container_name: whoami
+    expose:
+      - "80"
+
+  serverjsonata:
+    image: hrbolek/jsonata-federation:latest
+    container_name: serverjsonata
+    # ports:
+    #   - "8303:3000"
+    environment:
+      PORT: "3000"
+
+      # Headers that serverjsonata may forward to registered REST endpoints
+      # when endpoint.forwardHeaders === true.
+      FORWARD_HEADERS: >-
+        x-ms-client-principal,
+        x-ms-client-principal-id,
+        x-ms-client-principal-name,
+        x-request-id,
+        accept-language
+
+      ENDPOINTS_JSON: >
+        [
+          {
+            "name": "whoami",
+            "method": "GET",
+            "url": "http://whoami/api",
+            "forwardHeaders": true
+          }
+        ]
+  auth_shield:
+    build:
+      context: ./auth_shield
+    container_name: auth_shield
+    ports:
+      - "8090:8000"
+    environment:
+      APPLICATIONS_JSON: |
+        {
+          "whoami": {
+            "upstream": "http://whoami",
+            "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+            "allowed_corridor_prefixes": ["/api"]
+          },
+          "graphql": {
+            "upstream": "http://serverjsonata:3000/graphql",
+            "upstream_": "http://whoami/api",
+            "allowed_methods": ["POST"],
+            "allowed_corridor_prefixes": ["/graphql"]
+          },
+          "ui": {
+            "upstream": "http://ui",
+            "allowed_methods": ["GET"],
+            "allowed_corridor_prefixes": ["/graphql"]
+          }
+        }
+      CORRIDOR_UPSTREAM: http://serverjsonata:3000
+      TOKEN_TTL_SECONDS: "300"
+      MAX_TOKEN_ENTRIES: "10000"
+      REQUEST_TIMEOUT_SECONDS: "60"
+    depends_on:
+      - whoami
+      - serverjsonata
+
+  ui:
+    image: hrbolek/serverjsonata-ui:latest
+
+  fake_easy_entra_id:
+    build:
+      context: ./fake
+    container_name: fake_easy_entra_id
+    ports:
+      - "8088:8000"
+    volumes:
+      - ./fake:/app
+    environment:
+      TARGET_SERVER: http://auth_shield:8000
+      FAKE_USERS_JSON: /app/fake_users.json
+      FAKE_LOGIN_HTML_PATH: /app/index.html
+      FAKE_AUTH_COOKIE: fake_easy_entra_user
+    depends_on:
+      - auth_shield
+

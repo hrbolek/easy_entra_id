@@ -49,6 +49,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 APP_TITLE = os.getenv("APP_TITLE", "Fake Easy Entra ID")
 TARGET_SERVER = os.getenv("TARGET_SERVER", "http://frontend:8000")
+TARGET_SERVER = os.getenv("TARGET_SERVER", "http://localhost:8080")
 
 FAKE_AUTH_COOKIE = os.getenv("FAKE_AUTH_COOKIE", "fake_easy_entra_user")
 FAKE_USERS_JSON = os.getenv("FAKE_USERS_JSON", "fake_users.json")
@@ -247,6 +248,7 @@ def build_claims(user: dict[str, Any]) -> dict[str, Any]:
         "unique_name": user["unique_name"],
         "email": user["email"],
         "roles": user["roles"],
+        "scp": user.get("scopes", []),
         "auth_time": "0",
         "idp": "fake",
     }
