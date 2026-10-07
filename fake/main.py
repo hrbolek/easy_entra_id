@@ -36,6 +36,8 @@ import html
 import json
 import os
 import secrets
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from typing import Any
@@ -48,7 +50,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 BASE_DIR = Path(__file__).resolve().parent
 
 APP_TITLE = os.getenv("APP_TITLE", "Fake Easy Entra ID")
-TARGET_SERVER = os.getenv("TARGET_SERVER", "http://frontend:8000")
 TARGET_SERVER = os.getenv("TARGET_SERVER", "http://localhost:8080")
 
 FAKE_AUTH_COOKIE = os.getenv("FAKE_AUTH_COOKIE", "fake_easy_entra_user")
@@ -97,7 +98,21 @@ DEFAULT_USERS = [
 ]
 
 
-app = FastAPI(title=APP_TITLE)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Jeden sdílený klient pro celou aplikaci: zachová connection pool/keep-alive
+    # a neměří opakované vytváření klienta jako součást upstream času.
+    app.state.http = httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT_SECONDS,
+        follow_redirects=False,
+    )
+    try:
+        yield
+    finally:
+        await app.state.http.aclose()
+
+
+app = FastAPI(title=APP_TITLE, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------
@@ -404,7 +419,21 @@ def is_pass_through(path: str) -> bool:
     return any(path.startswith(prefix) for prefix in PASS_THROUGH_PREFIXES)
 
 
-async def proxy_to_target(request: Request, path: str, user: dict[str, Any]) -> Response:
+async def proxy_to_target(
+    request: Request,
+    path: str,
+    user: dict[str, Any],
+) -> tuple[Response, float]:
+    """
+    Proxy request to TARGET_SERVER.
+
+    Returns:
+        (response, proxied_server_ms)
+
+    proxied_server_ms measures only the await of the upstream HTTP request,
+    i.e. from handing the request to httpx until the complete upstream response
+    has been received by this proxy.
+    """
     target_path = path.lstrip("/")
     url = f"{TARGET_SERVER.rstrip('/')}/{target_path}"
 
@@ -431,16 +460,19 @@ async def proxy_to_target(request: Request, path: str, user: dict[str, Any]) -> 
 
     headers = add_fake_entra_headers(headers, user)
 
+    http: httpx.AsyncClient = request.app.state.http
+
+    upstream_started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False) as client:
-            upstream = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-            )
+        upstream = await http.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            content=body,
+        )
     except httpx.RequestError as e:
-        return JSONResponse(
+        proxied_server_ms = (time.perf_counter() - upstream_started) * 1000.0
+        response = JSONResponse(
             status_code=502,
             content={
                 "detail": "Target server request failed",
@@ -448,6 +480,9 @@ async def proxy_to_target(request: Request, path: str, user: dict[str, Any]) -> 
                 "reason": str(e),
             },
         )
+        return response, proxied_server_ms
+
+    proxied_server_ms = (time.perf_counter() - upstream_started) * 1000.0
 
     excluded_headers = {
         "connection",
@@ -461,16 +496,18 @@ async def proxy_to_target(request: Request, path: str, user: dict[str, Any]) -> 
         if key.lower() not in excluded_headers
     }
 
-    return Response(
+    response = Response(
         content=upstream.content,
         status_code=upstream.status_code,
         headers=response_headers,
         media_type=upstream.headers.get("content-type"),
     )
+    return response, proxied_server_ms
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
 async def catch_all(request: Request, path: str):
+    total_started = time.perf_counter()
     request_path = request.url.path
 
     if is_pass_through(request_path):
@@ -495,4 +532,15 @@ async def catch_all(request: Request, path: str):
             headers={"WWW-Authenticate": "Fake"},
         )
 
-    return await proxy_to_target(request, path, user)
+    response, proxied_server_ms = await proxy_to_target(request, path, user)
+    total_ms = (time.perf_counter() - total_started) * 1000.0
+
+    print(
+        f"[PROXY] {request.method} {request_path} "
+        f"status={response.status_code} "
+        f"total={total_ms:.2f}ms "
+        f"proxied_server={proxied_server_ms:.2f}ms",
+        flush=True,
+    )
+
+    return response
