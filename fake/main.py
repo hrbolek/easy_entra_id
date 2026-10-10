@@ -37,6 +37,9 @@ import json
 import os
 import secrets
 import time
+import uuid
+import logging
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -44,6 +47,10 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.utils import base64url_encode
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
@@ -58,6 +65,72 @@ FAKE_USERS_JSON = os.getenv("FAKE_USERS_JSON") or str(BASE_DIR / "fake_users.jso
 FAKE_LOGIN_HTML_PATH = BASE_DIR / "index.html"
 FAKE_LOGIN_HTML_PATH = os.getenv("FAKE_LOGIN_HTML_PATH", FAKE_LOGIN_HTML_PATH)
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
+
+# Logicka identita issueru nemusi odpovidat lokalni Docker DNS adrese.
+JWT_ISSUER = os.getenv("JWT_ISSUER", "https://auth.dev.company.cz").rstrip("/")
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "internal-api")
+JWT_DISCOVERY_BASE_URL = os.getenv(
+    "JWT_DISCOVERY_BASE_URL", "http://easy-entra-fake:8000"
+).rstrip("/")
+JWT_PRIVATE_KEY_FILE = Path(os.getenv(
+    "JWT_PRIVATE_KEY_FILE", "/tmp/easy-entra-id-fake/jwt-private.pem"
+))
+JWT_KEY_ID = os.getenv("JWT_KEY_ID", "fake-shield-dev-1")
+JWT_TOKEN_LIFETIME_SECONDS = int(os.getenv("JWT_TOKEN_LIFETIME_SECONDS", "900"))
+JWT_PROXY_BEARER = os.getenv("JWT_PROXY_BEARER", "false").lower() == "true"
+JWT_PROXY_IDENTITY_HEADER = os.getenv("JWT_PROXY_IDENTITY_HEADER", "false").lower() == "true"
+if JWT_TOKEN_LIFETIME_SECONDS < 1 or JWT_TOKEN_LIFETIME_SECONDS > 86400:
+    raise ValueError("JWT_TOKEN_LIFETIME_SECONDS must be between 1 and 86400")
+if not JWT_ISSUER.startswith("https://") and not JWT_ISSUER.startswith("http://"):
+    raise ValueError("JWT_ISSUER must be an absolute HTTP(S) URL")
+if not JWT_DISCOVERY_BASE_URL.startswith(("https://", "http://")):
+    raise ValueError("JWT_DISCOVERY_BASE_URL must be an absolute HTTP(S) URL")
+
+
+def load_signing_key():
+    """Generate a local development key once, or reuse a persisted RSA private key."""
+    key_file = JWT_PRIVATE_KEY_FILE
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    if not key_file.exists():
+        # Exclusive creation avoids silently replacing a concurrent container's key.
+        key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        try:
+            fd = os.open(str(key_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(pem)
+            logging.warning("Generated development JWT signing key at %s", key_file)
+        except FileExistsError:
+            pass
+    key = serialization.load_pem_private_key(key_file.read_bytes(), password=None)
+    if not isinstance(key, rsa.RSAPrivateKey):
+        raise ValueError("JWT_PRIVATE_KEY_FILE must contain an RSA private key")
+    return key
+
+
+def encode_rsa_number(value: int) -> str:
+    return base64url_encode(value.to_bytes((value.bit_length() + 7) // 8, "big")).decode("ascii")
+
+
+def create_identity_token(user: dict[str, Any]) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iss": JWT_ISSUER, "aud": JWT_AUDIENCE,
+        "sub": user["oid"], "oid": user["oid"], "tid": user["tenant_id"],
+        "name": user["name"], "email": user["email"],
+        "preferred_username": user["preferred_username"],
+        "roles": user["roles"], "idp": "fake",
+        "iat": now, "nbf": now,
+        "exp": now + timedelta(seconds=JWT_TOKEN_LIFETIME_SECONDS),
+        "jti": str(uuid.uuid4()),
+    }
+    return jwt.encode(payload, app.state.signing_key, algorithm="RS256",
+                      headers={"kid": JWT_KEY_ID, "typ": "JWT"})
+
 
 # Pro vývoj může být užitečné impersonovat uživatele hlavičkou.
 # Produkčně nikdy.
@@ -103,6 +176,7 @@ DEFAULT_USERS = [
 async def lifespan(app: FastAPI):
     # Jeden sdílený klient pro celou aplikaci: zachová connection pool/keep-alive
     # a neměří opakované vytváření klienta jako součást upstream času.
+    app.state.signing_key = load_signing_key()
     app.state.http = httpx.AsyncClient(
         timeout=HTTP_TIMEOUT_SECONDS,
         follow_redirects=False,
@@ -358,6 +432,56 @@ def read_login_template(request: Request, error: str | None = None) -> str:
 # ---------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------
+@app.get("/.well-known/openid-configuration")
+async def oidc_discovery():
+    # Minimal issuer discovery for JWT validation, NOT full OIDC implementation.
+    return {
+        "issuer": JWT_ISSUER,
+        "jwks_uri": f"{JWT_DISCOVERY_BASE_URL}/.well-known/jwks.json",
+        "id_token_signing_alg_values_supported": ["RS256"],
+    }
+
+
+@app.get("/.well-known/jwks.json")
+async def jwks(request: Request):
+    numbers = request.app.state.signing_key.public_key().public_numbers()
+    return {"keys": [{
+        "kty": "RSA", "use": "sig", "alg": "RS256", "kid": JWT_KEY_ID,
+        "n": encode_rsa_number(numbers.n),
+        "e": encode_rsa_number(numbers.e),
+    }]}
+
+
+@app.post("/auth/token")
+async def auth_token(request: Request):
+    # Only an existing fake session (or explicitly enabled fake impersonation)
+    # can request a token. Never accept a freely supplied user ID.
+    user = current_user_from_request(request)
+    if user is None:
+        return JSONResponse({"detail": "Not authenticated", "login": "/login"}, status_code=401)
+    return {
+        "access_token": create_identity_token(user),
+        "token_type": "Bearer",
+        "expires_in": JWT_TOKEN_LIFETIME_SECONDS,
+    }
+
+
+@app.get("/auth/verify")
+async def verify_token(request: Request):
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return JSONResponse({"detail": "Bearer token required"}, status_code=401)
+    try:
+        claims = jwt.decode(
+            authorization[7:].strip(), request.app.state.signing_key.public_key(),
+            algorithms=["RS256"], issuer=JWT_ISSUER, audience=JWT_AUDIENCE,
+            options={"require": ["iss", "aud", "sub", "exp", "iat", "nbf"]},
+        )
+    except jwt.PyJWTError:
+        return JSONResponse({"detail": "Invalid token"}, status_code=401)
+    return {"valid": True, "claims": claims}
+
+
 
 @app.get("/fake-health")
 async def fake_health():
@@ -460,6 +584,12 @@ async def proxy_to_target(
             headers.pop("cookie", None)
 
     headers = add_fake_entra_headers(headers, user)
+    # Strip caller-supplied fake identity JWT header (never trust external clients).
+    headers.pop("x-easy-entra-jwt", None)
+    if JWT_PROXY_BEARER:
+        headers["authorization"] = f"Bearer {create_identity_token(user)}"
+    if JWT_PROXY_IDENTITY_HEADER:
+        headers["x-easy-entra-jwt"] = create_identity_token(user)
 
     http: httpx.AsyncClient = request.app.state.http
 
