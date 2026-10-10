@@ -53,7 +53,8 @@ APP_TITLE = os.getenv("APP_TITLE", "Fake Easy Entra ID")
 TARGET_SERVER = os.getenv("TARGET_SERVER", "http://localhost:8080")
 
 FAKE_AUTH_COOKIE = os.getenv("FAKE_AUTH_COOKIE", "fake_easy_entra_user")
-FAKE_USERS_JSON = os.getenv("FAKE_USERS_JSON", "fake_users.json")
+# Výchozí JSON hledáme vedle tohoto modulu, nezávisle na pracovním adresáři.
+FAKE_USERS_JSON = os.getenv("FAKE_USERS_JSON") or str(BASE_DIR / "fake_users.json")
 FAKE_LOGIN_HTML_PATH = BASE_DIR / "index.html"
 FAKE_LOGIN_HTML_PATH = os.getenv("FAKE_LOGIN_HTML_PATH", FAKE_LOGIN_HTML_PATH)
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))

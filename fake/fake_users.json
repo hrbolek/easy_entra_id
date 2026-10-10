@@ -22,5 +22,13 @@
         "name": "Auditor",
         "roles": ["auditor", "user"],
         "scopes": ["read:profile", "read:messages"]
+    },
+    {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "oid": "00000000-0000-0000-0000-000000000001",
+        "email": "bootstrap@local",
+        "name": "Bootstrap Admin",
+        "roles": ["user"],
+        "scopes": ["read:profile", "read:messages"]
     }
 ]
