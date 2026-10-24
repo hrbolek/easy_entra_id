@@ -568,7 +568,24 @@ async def proxy_to_target(
     body = await request.body()
 
     headers = dict(request.headers)
-    headers.pop("host", None)
+    # Connection-specific request headers do not belong on the upstream request.
+    # httpx will calculate Host, Content-Length and transfer framing itself.
+    request_excluded = {
+        "host", "connection", "keep-alive", "proxy-connection",
+        "proxy-authenticate", "proxy-authorization", "te", "trailer",
+        "transfer-encoding", "upgrade", "content-length",
+    }
+    connection_tokens = {
+        token.strip().lower()
+        for token in headers.get("connection", "").split(",")
+        if token.strip()
+    }
+    for key in list(headers):
+        if key.lower() in request_excluded | connection_tokens:
+            headers.pop(key, None)
+    # The proxy sends decoded response.content. Request an uncompressed upstream
+    # representation to avoid unnecessary decompression and metadata mismatches.
+    headers["accept-encoding"] = "identity"
 
     # Cookie fake identity je jen pro tento kontejner, dovnitř stacku ji neposíláme.
     cookie = headers.get("cookie")
@@ -615,16 +632,23 @@ async def proxy_to_target(
 
     proxied_server_ms = (time.perf_counter() - upstream_started) * 1000.0
 
+    # httpx transparently decompresses upstream.content. Never reuse the
+    # upstream Content-Length or Content-Encoding with those decoded bytes.
+    # Starlette will compute the correct Content-Length from response.content.
     excluded_headers = {
-        "connection",
-        "content-encoding",
-        "transfer-encoding",
+        "connection", "keep-alive", "proxy-connection",
+        "proxy-authenticate", "proxy-authorization", "te", "trailer",
+        "transfer-encoding", "upgrade", "content-length", "content-encoding",
     }
-
+    connection_tokens = {
+        token.strip().lower()
+        for token in upstream.headers.get("connection", "").split(",")
+        if token.strip()
+    }
     response_headers = {
         key: value
         for key, value in upstream.headers.items()
-        if key.lower() not in excluded_headers
+        if key.lower() not in excluded_headers | connection_tokens
     }
 
     response = Response(
