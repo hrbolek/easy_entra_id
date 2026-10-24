@@ -36,7 +36,7 @@ jobs:
             dockerfile: ./fake/Dockerfile
 
           - name: auth-shield
-            image: ghcr.io/${{ github.repository }}-fake
+            image: ghcr.io/${{ github.repository }}-auth-shield
             context: ./auth_shield
             dockerfile: ./auth_shield/Dockerfile
 
