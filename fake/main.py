@@ -11,10 +11,32 @@ Fake Easy Entra ID pro lokální debug/development.
         x-ms-client-principal
         x-ms-client-principal-id
         x-ms-client-principal-name
-    - volitelně vydává a ověřuje vlastní RS256 JWT, aby šel lokálně testovat
-      i auth_shield bez reálného Microsoft Entra ID
+    - vydává vlastní RS256 JWT a publikuje JWKS, takže funguje jako
+      plnohodnotný vydavatel identity pro auth_shield
 
-Tím lze lokálně testovat stejný frontend bridge, který v produkci běží za easy_entra_id.
+Spolupráce s auth_shield
+========================
+
+auth_shield ověřuje příchozí JWT proti registrovaným vydavatelům. Fake je
+jeden z nich, takže musí splnit stejný kontrakt jako reálné Entra ID:
+
+    issuer    = JWT_ISSUER            (logická identita, ne adresa)
+    jwks_uri  = JWT_DISCOVERY_BASE_URL + /.well-known/jwks.json
+    audience  = JWT_AUDIENCE
+    podpis    = RS256, kid = JWT_KEY_ID
+
+Na straně auth_shield to odpovídá položce v `ISSUERS_JSON`:
+
+    {
+      "fake": {
+        "issuer": "https://auth.dev.company.cz",
+        "jwks_uri": "http://easy-entra-fake:8000/.well-known/jwks.json",
+        "audience": ["internal-api"]
+      }
+    }
+
+`/fake-health` vrací `issuer`, `audience` a `jwks_uri`, takže se hodnoty
+nemusí opisovat ručně.
 
 Použití:
     uvicorn main:app --host 0.0.0.0 --port 8000
@@ -25,25 +47,34 @@ Typické env:
     FAKE_LOGIN_HTML_PATH=/app/index.html
     FAKE_AUTH_COOKIE=fake_easy_entra_user
     FAKE_ALLOW_HEADER_IMPERSONATION=false
-    FAKE_PASS_THROUGH_PREFIXES=/login,/fake-select-user,/fake-logout,/fake-users,/fake-health
+    FAKE_PASS_THROUGH_PREFIXES=/login,/fake-select-user,/fake-logout,/fake-users,/fake-health,/auth/login
     HTTP_TIMEOUT_SECONDS=30
 
-JWT (volitelné, určeno pro auth_shield):
+JWT (určeno pro auth_shield):
     JWT_ISSUER=https://auth.dev.company.cz
     JWT_AUDIENCE=internal-api
     JWT_DISCOVERY_BASE_URL=http://easy-entra-fake:8000
     JWT_PRIVATE_KEY_FILE=/tmp/easy-entra-id-fake/jwt-private.pem
     JWT_KEY_ID=fake-shield-dev-1
     JWT_TOKEN_LIFETIME_SECONDS=900
-    JWT_PROXY_BEARER=false
-    JWT_PROXY_IDENTITY_HEADER=false
+    JWT_PROXY_MODE=bearer
+
+`JWT_PROXY_MODE` určuje, jak se token předává upstreamu:
+
+    bearer  Authorization: Bearer <JWT>   (vyžaduje auth_shield)
+    header  x-easy-entra-jwt: <JWT>
+    both    obojí
+    none    jen EasyAuth principal hlavičky (původní chování)
+
+Staré `JWT_PROXY_BEARER` / `JWT_PROXY_IDENTITY_HEADER` fungují dál a sčítají
+se s `JWT_PROXY_MODE`.
 
 Endpointy:
     GET  /login                        výběr fake uživatele
     POST /login, /fake-select-user     přihlášení jako zvolený uživatel
     GET  /fake-logout                  odhlášení
     GET  /fake-users                   seznam uživatelů (JSON)
-    GET  /fake-health                  health check
+    GET  /fake-health                  health check + issuer/jwks metadata
     GET  /.well-known/openid-configuration
     GET  /.well-known/jwks.json
     POST /auth/token                   vydání JWT pro aktuální fake session
@@ -104,14 +135,40 @@ JWT_PRIVATE_KEY_FILE = Path(os.getenv(
 ))
 JWT_KEY_ID = os.getenv("JWT_KEY_ID", "fake-shield-dev-1")
 JWT_TOKEN_LIFETIME_SECONDS = int(os.getenv("JWT_TOKEN_LIFETIME_SECONDS", "900"))
-JWT_PROXY_BEARER = os.getenv("JWT_PROXY_BEARER", "false").lower() == "true"
-JWT_PROXY_IDENTITY_HEADER = os.getenv("JWT_PROXY_IDENTITY_HEADER", "false").lower() == "true"
+# How the fake identity is propagated to the upstream (auth_shield).
+#   bearer  - Authorization: Bearer <JWT>   (required by auth_shield)
+#   header  - x-easy-entra-jwt: <JWT>
+#   both    - both of the above
+#   none    - only EasyAuth principal headers (legacy behaviour)
+JWT_PROXY_MODE = os.getenv("JWT_PROXY_MODE", "bearer").strip().lower()
+if JWT_PROXY_MODE not in {"bearer", "header", "both", "none"}:
+    raise ValueError(
+        "JWT_PROXY_MODE must be one of: bearer, header, both, none"
+    )
+
+# Legacy booleans kept for backwards compatibility. They are OR-ed with
+# JWT_PROXY_MODE so existing compose files keep working.
+JWT_PROXY_BEARER = (
+    os.getenv("JWT_PROXY_BEARER", "false").lower() == "true"
+    or JWT_PROXY_MODE in {"bearer", "both"}
+)
+JWT_PROXY_IDENTITY_HEADER = (
+    os.getenv("JWT_PROXY_IDENTITY_HEADER", "false").lower() == "true"
+    or JWT_PROXY_MODE in {"header", "both"}
+)
+
 if JWT_TOKEN_LIFETIME_SECONDS < 1 or JWT_TOKEN_LIFETIME_SECONDS > 86400:
     raise ValueError("JWT_TOKEN_LIFETIME_SECONDS must be between 1 and 86400")
 if not JWT_ISSUER.startswith("https://") and not JWT_ISSUER.startswith("http://"):
     raise ValueError("JWT_ISSUER must be an absolute HTTP(S) URL")
 if not JWT_DISCOVERY_BASE_URL.startswith(("https://", "http://")):
     raise ValueError("JWT_DISCOVERY_BASE_URL must be an absolute HTTP(S) URL")
+# `iss` and `jwks_uri` are compared by exact match on the consumer side, so a
+# trailing slash or query would silently break validation.
+if JWT_ISSUER.endswith("/"):
+    raise ValueError("JWT_ISSUER must not end with a trailing slash")
+if JWT_DISCOVERY_BASE_URL.endswith("/"):
+    raise ValueError("JWT_DISCOVERY_BASE_URL must not end with a trailing slash")
 
 
 def load_signing_key():
@@ -172,11 +229,17 @@ FAKE_ALLOW_HEADER_IMPERSONATION = (
     os.getenv("FAKE_ALLOW_HEADER_IMPERSONATION", "false").lower() == "true"
 )
 
+# Strojový login (`POST /auth/login`) vrací JWT přímo v těle odpovědi.
+# Zapíná se explicitně, protože obchází proklikání formulářem.
+FAKE_ENABLE_MACHINE_LOGIN = (
+    os.getenv("FAKE_ENABLE_MACHINE_LOGIN", "false").lower() == "true"
+)
+
 PASS_THROUGH_PREFIXES = tuple(
     p.strip()
     for p in os.getenv(
         "FAKE_PASS_THROUGH_PREFIXES",
-        "/login,/fake-select-user,/fake-logout,/fake-users,/fake-health",
+        "/login,/fake-select-user,/fake-logout,/fake-users,/fake-health,/auth/login",
     ).split(",")
     if p.strip()
 )
@@ -316,6 +379,25 @@ def find_user(identifier: str | None) -> dict[str, Any] | None:
             return user
 
     return None
+
+
+def verify_user_password(user: dict[str, Any], password: str) -> bool:
+    """
+    Ověří heslo fake uživatele.
+
+    Pokud má uživatel v JSONu `password`, porovnává se s ním. Jinak se
+    uplatní dev konvence `password == email`, aby šel strojový login použít
+    bez úprav datového souboru.
+
+    Porovnání je konstantní v čase, aby nešlo heslo uhádnout po znacích.
+    """
+    expected = user["raw"].get("password")
+
+    if not isinstance(expected, str) or not expected:
+        expected = user["email"]
+
+    return secrets.compare_digest(password, expected)
+
 
 # In-memory session store pro fake login.
 # Cookie obsahuje pouze náhodný opaque token, ne e-mail ani jiné claimy.
@@ -531,6 +613,7 @@ async def oidc_discovery():
         "issuer": JWT_ISSUER,
         "jwks_uri": f"{JWT_DISCOVERY_BASE_URL}/.well-known/jwks.json",
         "id_token_signing_alg_values_supported": ["RS256"],
+        "audiences_supported": [JWT_AUDIENCE],
     }
 
 
@@ -565,6 +648,83 @@ async def auth_token(request: Request):
     }
 
 
+@app.post("/auth/login")
+async def machine_login(request: Request):
+    """
+    Strojový login: e-mail + heslo -> JWT přímo v těle odpovědi.
+
+    Určeno pro klienty, kteří neumí pracovat s cookie (skripty, CI, testy).
+    Na rozdíl od `POST /login` nenastavuje session cookie a nevrací
+    přesměrování, takže klient dostane token v jednom requestu.
+
+    Heslo se ověřuje přes `verify_user_password`: pokud má uživatel
+    v `fake_users.json` pole `password`, použije se to; jinak platí dev
+    konvence `password == email`.
+
+    Endpoint je vypnutý, dokud není nastaveno `FAKE_ENABLE_MACHINE_LOGIN=true`.
+    """
+    if not FAKE_ENABLE_MACHINE_LOGIN:
+        return JSONResponse(
+            {"detail": "Machine login is disabled"},
+            status_code=404,
+        )
+
+    payload = await _read_login_payload(request)
+
+    email = str(payload.get("email") or payload.get("user") or "").strip()
+    password = str(payload.get("password") or "")
+
+    if not email or not password:
+        return JSONResponse(
+            {"detail": "Both 'email' and 'password' are required"},
+            status_code=400,
+        )
+
+    user = find_user(email)
+
+    # Same response for unknown user and wrong password: no user enumeration.
+    if user is None or not verify_user_password(user, password):
+        return JSONResponse(
+            {"detail": "Invalid credentials"},
+            status_code=401,
+        )
+
+    return {
+        "access_token": create_identity_token(user),
+        "token_type": "Bearer",
+        "expires_in": JWT_TOKEN_LIFETIME_SECONDS,
+        "user": {
+            "oid": user["oid"],
+            "email": user["email"],
+            "name": user["name"],
+            "roles": user["roles"],
+        },
+    }
+
+
+async def _read_login_payload(request: Request) -> dict[str, Any]:
+    """
+    Přečte přihlašovací údaje z JSONu i z form-encoded těla.
+
+    JSON je primární formát pro strojové klienty; form-encoded je doplněk,
+    aby šel endpoint použít i z `curl -d` bez hlavičky `content-type`.
+    """
+    content_type = request.headers.get("content-type", "").lower()
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    if "form" in content_type:
+        form = await request.form()
+        return {key: str(value) for key, value in form.items()}
+
+    return {}
+
+
 @app.get("/auth/verify")
 async def verify_token(request: Request):
     """
@@ -590,12 +750,22 @@ async def verify_token(request: Request):
 
 @app.get("/fake-health")
 async def fake_health():
-    """Health check pro docker-compose a rychlé ověření, že fake běží."""
+    """
+    Health check pro docker-compose a rychlé ověření, že fake běží.
+
+    Vrací i `issuer` a `jwks_uri`, ze kterých se dá přímo sestavit
+    `ISSUERS_JSON` pro auth_shield.
+    """
     return {
         "ok": True,
         "service": "fake_easy_entra_id",
         "target_server": TARGET_SERVER,
         "users_count": len(load_fake_users()),
+        "issuer": JWT_ISSUER,
+        "audience": JWT_AUDIENCE,
+        "jwks_uri": f"{JWT_DISCOVERY_BASE_URL}/.well-known/jwks.json",
+        "key_id": JWT_KEY_ID,
+        "proxy_mode": JWT_PROXY_MODE,
     }
 
 
@@ -717,12 +887,21 @@ async def proxy_to_target(
             headers.pop("cookie", None)
 
     headers = add_fake_entra_headers(headers, user)
-    # Strip caller-supplied fake identity JWT header (never trust external clients).
+
+    # Never forward caller-supplied credentials. The fake is the identity
+    # issuer, so it always replaces them with a token for the selected user.
+    headers.pop("authorization", None)
     headers.pop("x-easy-entra-jwt", None)
-    if JWT_PROXY_BEARER:
-        headers["authorization"] = f"Bearer {create_identity_token(user)}"
-    if JWT_PROXY_IDENTITY_HEADER:
-        headers["x-easy-entra-jwt"] = create_identity_token(user)
+
+    if JWT_PROXY_BEARER or JWT_PROXY_IDENTITY_HEADER:
+        # One token per request: the same value goes to both carriers so a
+        # consumer that reads either one sees the same identity.
+        token = create_identity_token(user)
+
+        if JWT_PROXY_BEARER:
+            headers["authorization"] = f"Bearer {token}"
+        if JWT_PROXY_IDENTITY_HEADER:
+            headers["x-easy-entra-jwt"] = token
 
     http: httpx.AsyncClient = request.app.state.http
 

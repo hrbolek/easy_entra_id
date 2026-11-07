@@ -17,15 +17,29 @@ services:
           "whoami": {
             "upstream": "http://whoami",
             "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-            "allowed_corridor_prefixes": ["/graphql"]
+            "allowed_corridor_prefixes": ["/api"]
           }
         }
-      CORRIDOR_UPSTREAM: http://serverjsonata:3000
+      ISSUERS_JSON: >
+        {
+          "fake": {
+            "issuer": "https://auth.dev.company.cz",
+            "jwks_uri": "http://fake_easy_entra_id:8000/.well-known/jwks.json",
+            "audience": ["internal-api"]
+          }
+        }
+      SHIELD_ISSUER: https://auth-shield.dev.internal
+      SHIELD_JWKS_BASE_URL: http://auth_shield:8000
+      SHIELD_SIGNING_KEY_FILE: /data/signing-key.pem
+      CORRIDOR_UPSTREAM: http://whoami
       TOKEN_TTL_SECONDS: "300"
       MAX_TOKEN_ENTRIES: "10000"
       REQUEST_TIMEOUT_SECONDS: "60"
+    volumes:
+      - shield_keys:/data
     depends_on:
       - whoami
+      - fake_easy_entra_id
 
   fake_easy_entra_id:
     build:
@@ -35,10 +49,21 @@ services:
       - "8088:8000"
     volumes:
       - ./fake:/app
+      - fake_keys:/tmp/easy-entra-id-fake
     environment:
       TARGET_SERVER: http://auth_shield:8000/whoami
       FAKE_USERS_JSON: /app/fake_users.json
       FAKE_LOGIN_HTML_PATH: /app/index.html
       FAKE_AUTH_COOKIE: fake_easy_entra_user
+      JWT_ISSUER: https://auth.dev.company.cz
+      JWT_AUDIENCE: internal-api
+      JWT_DISCOVERY_BASE_URL: http://fake_easy_entra_id:8000
+      JWT_PRIVATE_KEY_FILE: /tmp/easy-entra-id-fake/jwt-private.pem
+      JWT_KEY_ID: fake-shield-dev-1
+      JWT_PROXY_MODE: bearer
     depends_on:
       - auth_shield
+
+volumes:
+  shield_keys:
+  fake_keys:
