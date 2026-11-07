@@ -7,6 +7,10 @@ krátkodobý opaque handle, který Shield umí přeložit zpět.
 > ⚠️ `TokenVault` je procesně lokální. Musí běžet **právě jeden** Uvicorn
 > worker, jinak se handle vydaný jedním workerem v jiném nenajde.
 
+> 📄 Chystaná změna: varianta, kde Shield vystupuje jako interní STS a vydává
+> ověřitelné JWT, je popsaná v [Návrh: Shield jako interní STS](#návrh-shield-jako-interní-sts).
+> Aktuální kód se podle ní zatím nechová.
+
 ## Dva směry provozu
 
 ```text
@@ -197,3 +201,123 @@ curl -i http://localhost:8090/whoami/api
 - `Set-Cookie` se nepropouští, takže Shield není vhodný pro aplikace, které
   staví session na cookies z upstreamu.
 - Není to OIDC server — Shield jen konzumuje EasyAuth kontrakt.
+
+---
+
+## Návrh: Shield jako interní STS
+
+> **Stav: návrh, neimplementováno.** Tato sekce popisuje cílový stav. Aktuální
+> kód v `main.py` používá opaque handle a `TokenVault` popsaný výše.
+
+### Motivace
+
+Opaque handle má tři slabiny:
+
+1. **Validace jen dotazem do vaultu** — každý request znamená lookup, takže
+   Shield nemůže běžet ve více replikách a je to SPOF.
+2. **Nestandardní kontrakt** — aplikace musí umět `shld_...`, nemůže použít
+   hotový JWT middleware.
+3. **Autorizace až za proxy** — `roles`/`scp` nejsou v ruce volajícího, takže
+   se rozhoduje jen podle `x-shield-*` hlaviček.
+
+Cílový stav: Shield je **interní STS** (security token service). Vydává
+standardní RS256 JWT, které si každý člen kapsle ověří sám přes JWKS.
+
+### Klíčové rozhodnutí: symetrická hranice kapsle
+
+Kapsle = množina služeb za `auth_shield`. Na **obou** hranicích se mluví JWT:
+
+```mermaid
+flowchart LR
+  C[client] --> E[easy_entra_id<br/>EasyAuth]
+  E -->|principal| S[auth_shield<br/>interní STS]
+  S -->|JWT aud=app| A[aplikace]
+  A -->|JWT aud=next| S
+  S -->|JWT aud=next| B[další prvek kapsle]
+  A -->|JWT| S2[auth_shield<br/>hraniční bod]
+  S2 -->|JWT| X[externí systém]
+```
+
+- **Dovnitř** — Shield ověří EasyAuth principal a vydá JWT pro cílovou aplikaci.
+- **Uvnitř** — aplikace volá další prvek kapsle s JWT; Shield ho ověří a vydá
+  **nový** JWT s `aud` cíle.
+- **Ven** — volající pošle JWT, Shield ho ověří a předá dál JWT (ne původní
+  Entra token).
+
+### Proč se nevrací původní Entra token
+
+Výměna JWT zpět za původní Entra access token je **token passthrough** a je to
+anti-pattern:
+
+- příjemce nemá jak poznat, pro koho byl token vydán (audience confusion),
+- token uniklý z jedné služby jde zneužít v celé kapsli i mimo ni,
+- Shield by musel držet reálné credentials v paměti a řešit jejich refresh.
+
+Symetrická hranice (JWT dovnitř, JWT ven) tento problém nemá: každý token má
+jednoznačný `aud` a krátkou platnost. Pokud externí systém vyžaduje Entra token,
+patří to do samostatného adaptéru s OBO flow, ne do proxy.
+
+### Formát tokenu
+
+```json
+{
+  "iss": "https://shield.internal",
+  "aud": "whoami",
+  "sub": "<oid>",
+  "azp": "graphql",
+  "act": { "sub": "<oid>" },
+  "roles": ["auditor"],
+  "scp": ["read:profile"],
+  "tid": "<tenant>",
+  "jti": "<uuid>",
+  "iat": 0, "nbf": 0, "exp": 0
+}
+```
+
+| Claim | Význam |
+| --- | --- |
+| `aud` | **Vždy** konkrétní cíl, nikdy globální hodnota |
+| `azp` | Kdo token požádal (volající prvek kapsle) |
+| `act` | Původní subjekt při delegaci (RFC 8693) |
+| `roles` / `scp` | Autorizace dostupná lokálně bez dotazu |
+| `jti` | Identifikátor pro logování a případný denylist |
+
+### Endpointy
+
+| Metoda | Cesta | Popis |
+| --- | --- | --- |
+| `GET` | `/.well-known/openid-configuration` | Discovery (`jwks_uri`, `issuer`) |
+| `GET` | `/.well-known/jwks.json` | Veřejné klíče, `kid` + rotace |
+| `POST` | `/auth/exchange` | Výměna JWT za JWT s jiným `aud` (RFC 8693) |
+| `GET` | `/health` | Stav, seznam aplikací, `kid` v rotaci |
+
+### Bezpečnostní pravidla
+
+- `aud` vždy konkrétní cíl; token pro `whoami` nesmí projít do `graphql`.
+- TTL 60–300 s, žádné refresh tokeny uvnitř kapsle.
+- Rotace klíčů: nový `kid` se publikuje dřív, starý zůstává v JWKS po dobu
+  overlapu (min. 2× TTL).
+- Privátní klíč přes secret/volume, aby všechny repliky validovaly stejně.
+- `/auth/exchange` musí být vázaný na volajícího (mTLS, network policy nebo
+  per-app secret) — samotný JWT k výměně nestačí.
+- `Authorization` nikdy do logů, logovat jen `jti` a `azp`.
+- Clock skew 30–60 s.
+
+### Dopad na dnešní kód
+
+| Prvek | Dnes | Po změně |
+| --- | --- | --- |
+| `TokenVault` | nutný pro každý request | není potřeba pro interní hop |
+| Počet workerů | právě 1 | libovolný (validace je lokální) |
+| `x-shield-*` hlavičky | nositel identity | jen doplňkové, identita je v JWT |
+| `SENSITIVE_HEADERS` | zahazuje `authorization` | `authorization` se ověřuje, ne zahazuje |
+
+### Migrace
+
+1. `SHIELD_TOKEN_MODE=handle|jwt|both` — handle zůstane pro zpětnou
+   kompatibilitu.
+2. Aplikace přejdou na lokální validaci JWT přes JWKS.
+3. Handle se vypustí; `TokenVault` zůstane jen pro externí adaptér s OBO.
+
+`fake` už dnes umí RS256, JWKS i discovery, takže slouží jako testovací IdP
+a obě služby zůstanou symetrické.
