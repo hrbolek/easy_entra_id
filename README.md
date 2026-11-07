@@ -170,6 +170,8 @@ ghcr.io/hrbolek/easy_entra_id:v0.1.0
 
 `easy_entra_id_fake` je vývojová / debug varianta služby. Slouží jako náhrada nebo simulace autentizační vrstvy pro lokální vývoj a testování.
 
+Konfigurace, endpointy a příklady spuštění jsou v [fake/README.md](./fake/README.md).
+
 Image je publikována do GitHub Container Registry jako samostatná image:
 
 ```text

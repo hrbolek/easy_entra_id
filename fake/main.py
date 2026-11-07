@@ -1,27 +1,54 @@
-# fake_easy_entra_id.py
+# fake/main.py
 """
 Fake Easy Entra ID pro lokální debug/development.
 
 Účel:
     - chová se jako jednoduchá reverzní proxy před docker stackem
     - místo Microsoft Entra ID loginu zobrazí statickou stránku s výběrem uživatele
-    - zvoleného uživatele uloží do cookie
+    - zvoleného uživatele uloží do cookie (cookie nese jen opaque token,
+      session samotná žije v paměti procesu)
     - při proxyování požadavku dovnitř stacku doplní hlavičky:
         x-ms-client-principal
         x-ms-client-principal-id
         x-ms-client-principal-name
+    - volitelně vydává a ověřuje vlastní RS256 JWT, aby šel lokálně testovat
+      i auth_shield bez reálného Microsoft Entra ID
 
 Tím lze lokálně testovat stejný frontend bridge, který v produkci běží za easy_entra_id.
 
 Použití:
-    uvicorn fake_easy_entra_id:app --host 0.0.0.0 --port 8000
+    uvicorn main:app --host 0.0.0.0 --port 8000
 
 Typické env:
     TARGET_SERVER=http://frontend:8000
     FAKE_USERS_JSON=/app/fake_users.json
-    FAKE_LOGIN_HTML_PATH=/app/fake_login.html
+    FAKE_LOGIN_HTML_PATH=/app/index.html
     FAKE_AUTH_COOKIE=fake_easy_entra_user
     FAKE_ALLOW_HEADER_IMPERSONATION=false
+    FAKE_PASS_THROUGH_PREFIXES=/login,/fake-select-user,/fake-logout,/fake-users,/fake-health
+    HTTP_TIMEOUT_SECONDS=30
+
+JWT (volitelné, určeno pro auth_shield):
+    JWT_ISSUER=https://auth.dev.company.cz
+    JWT_AUDIENCE=internal-api
+    JWT_DISCOVERY_BASE_URL=http://easy-entra-fake:8000
+    JWT_PRIVATE_KEY_FILE=/tmp/easy-entra-id-fake/jwt-private.pem
+    JWT_KEY_ID=fake-shield-dev-1
+    JWT_TOKEN_LIFETIME_SECONDS=900
+    JWT_PROXY_BEARER=false
+    JWT_PROXY_IDENTITY_HEADER=false
+
+Endpointy:
+    GET  /login                        výběr fake uživatele
+    POST /login, /fake-select-user     přihlášení jako zvolený uživatel
+    GET  /fake-logout                  odhlášení
+    GET  /fake-users                   seznam uživatelů (JSON)
+    GET  /fake-health                  health check
+    GET  /.well-known/openid-configuration
+    GET  /.well-known/jwks.json
+    POST /auth/token                   vydání JWT pro aktuální fake session
+    GET  /auth/verify                  ověření Bearer JWT
+    *    /{path}                       proxy na TARGET_SERVER
 
 Bezpečnost:
     Toto je pouze debug/development nástroj.
@@ -113,10 +140,17 @@ def load_signing_key():
 
 
 def encode_rsa_number(value: int) -> str:
+    """Zakóduje RSA parametr (n/e) do base64url bez paddingu, jak ho čeká JWKS."""
     return base64url_encode(value.to_bytes((value.bit_length() + 7) // 8, "big")).decode("ascii")
 
 
 def create_identity_token(user: dict[str, Any]) -> str:
+    """
+    Vytvoří RS256 JWT s Entra-like claimy pro daného fake uživatele.
+
+    Token je podepsaný klíčem z app.state.signing_key a má `kid` shodný s JWKS,
+    takže ho auth_shield i /auth/verify ověří stejně jako reálný Entra token.
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "iss": JWT_ISSUER, "aud": JWT_AUDIENCE,
@@ -230,6 +264,13 @@ def load_fake_users() -> list[dict[str, Any]]:
 
 
 def normalize_user(user: dict[str, Any]) -> dict[str, Any]:
+    """
+    Sjednotí zápis uživatele z JSONu do interního tvaru.
+
+    Chybějící pole dopočítá (oid z id/emailu, preferred_username z emailu,
+    tenant_id na "fake-tenant") a `roles` přijme i jako čárkou oddělený string.
+    Původní objekt zůstává v `raw`.
+    """
     email = str(user.get("email") or user.get("preferred_username") or user.get("name") or "unknown@example.com")
     oid = str(user.get("oid") or user.get("id") or email)
     user_id = str(user.get("id") or oid)
@@ -253,6 +294,12 @@ def normalize_user(user: dict[str, Any]) -> dict[str, Any]:
 
 
 def find_user(identifier: str | None) -> dict[str, Any] | None:
+    """
+    Dohledá uživatele podle libovolného identifikátoru.
+
+    Přijímá id, oid, email, preferred_username i unique_name, aby šlo v URL,
+    cookie i hlavičce `x-fake-user` použít cokoli z toho.
+    """
     if not identifier:
         return None
 
@@ -278,6 +325,12 @@ TOKEN_BY_USER_ID: dict[str, str] = {}
 
 
 def user_to_cookie_value(user: dict[str, Any]) -> str:
+    """
+    Vrátí opaque token pro cookie, případně založí novou session.
+
+    Pro stejného uživatele se reusuje existující token, aby opakované přihlášení
+    neakumulovalo session v paměti.
+    """
     user_id = user["id"]
 
     existing_token = TOKEN_BY_USER_ID.get(user_id)
@@ -291,6 +344,7 @@ def user_to_cookie_value(user: dict[str, Any]) -> str:
 
 
 def user_from_cookie_value(cookie_value: str | None) -> dict[str, Any] | None:
+    """Přeloží opaque cookie token na uživatele; neznámý token vrací None."""
     if not cookie_value:
         return None
 
@@ -302,6 +356,7 @@ def user_from_cookie_value(cookie_value: str | None) -> dict[str, Any] | None:
 
 
 def forget_cookie_value(cookie_value: str | None) -> None:
+    """Zruší session pro daný cookie token (logout)."""
     if not cookie_value:
         return
 
@@ -311,6 +366,12 @@ def forget_cookie_value(cookie_value: str | None) -> None:
 
 
 def current_user_from_request(request: Request) -> dict[str, Any] | None:
+    """
+    Určí aktuálního fake uživatele z requestu.
+
+    Prioritu má hlavička `x-fake-user`, ale jen když je explicitně povolená
+    přes FAKE_ALLOW_HEADER_IMPERSONATION. Jinak rozhoduje session cookie.
+    """
     if FAKE_ALLOW_HEADER_IMPERSONATION:
         header_user = request.headers.get("x-fake-user")
         if header_user:
@@ -327,6 +388,12 @@ def current_user_from_request(request: Request) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------
 
 def build_claims(user: dict[str, Any]) -> dict[str, Any]:
+    """
+    Sestaví Entra-like claim sadu, kterou nese x-ms-client-principal.
+
+    `scp` se bere z `scopes` v JSONu; ostatní claimy odpovídají tomu, co
+    auth_shield očekává od EasyAuth hlaviček.
+    """
     return {
         "aud": "fake-easy-entra-id",
         "iss": "https://fake.easy-entra-id.local/v2.0",
@@ -345,6 +412,12 @@ def build_claims(user: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_x_ms_client_principal(user: dict[str, Any]) -> str:
+    """
+    Zakóduje principal do formátu App Service EasyAuth.
+
+    Výsledkem je base64 JSON s `auth_typ`/`name_typ`/`role_typ` a polem `claims`,
+    kde jsou všechny hodnoty stringy (listy spojené čárkou).
+    """
     claims = build_claims(user)
 
     principal = {
@@ -365,6 +438,12 @@ def build_x_ms_client_principal(user: dict[str, Any]) -> str:
 
 
 def add_fake_entra_headers(headers: dict[str, str], user: dict[str, Any]) -> dict[str, str]:
+    """
+    Doplní do kopie hlaviček EasyAuth identitu zvoleného uživatele.
+
+    Všechny příchozí `x-ms-client-principal*` hlavičky nejdřív zahodí, aby
+    klient nemohl podstrčit cizí identitu.
+    """
     result = dict(headers)
 
     # Odstraníme případné podstrčené hodnoty z klienta.
@@ -385,6 +464,13 @@ def add_fake_entra_headers(headers: dict[str, str], user: dict[str, Any]) -> dic
 # ---------------------------------------------------------------------
 
 def read_login_template(request: Request, error: str | None = None) -> str:
+    """
+    Načte index.html a vloží do něj data pro React UI.
+
+    Data se serializují jako JSON a escapují (`&`, `<`, `>`), aby šla bezpečně
+    vložit do `<script type="application/json">`. Při chybějícím template
+    vrátí minimální náhradní HTML.
+    """
     users = load_fake_users()
     current_user = current_user_from_request(request)
 
@@ -434,6 +520,12 @@ def read_login_template(request: Request, error: str | None = None) -> str:
 # ---------------------------------------------------------------------
 @app.get("/.well-known/openid-configuration")
 async def oidc_discovery():
+    """
+    Minimální OIDC discovery dokument.
+
+    Slouží jen k tomu, aby si klient (auth_shield) našel `jwks_uri`.
+    Nejde o plnohodnotnou OIDC implementaci.
+    """
     # Minimal issuer discovery for JWT validation, NOT full OIDC implementation.
     return {
         "issuer": JWT_ISSUER,
@@ -444,6 +536,7 @@ async def oidc_discovery():
 
 @app.get("/.well-known/jwks.json")
 async def jwks(request: Request):
+    """Publikuje veřejnou část podpisového RSA klíče ve formátu JWKS."""
     numbers = request.app.state.signing_key.public_key().public_numbers()
     return {"keys": [{
         "kty": "RSA", "use": "sig", "alg": "RS256", "kid": JWT_KEY_ID,
@@ -454,6 +547,12 @@ async def jwks(request: Request):
 
 @app.post("/auth/token")
 async def auth_token(request: Request):
+    """
+    Vydá JWT pro aktuálně přihlášeného fake uživatele.
+
+    Token se vydává jen na základě existující fake session (nebo explicitně
+    povolené impersonace hlavičkou), nikdy pro uživatele zadaného v requestu.
+    """
     # Only an existing fake session (or explicitly enabled fake impersonation)
     # can request a token. Never accept a freely supplied user ID.
     user = current_user_from_request(request)
@@ -468,6 +567,12 @@ async def auth_token(request: Request):
 
 @app.get("/auth/verify")
 async def verify_token(request: Request):
+    """
+    Ověří Bearer JWT vydaný tímto fake issuerem.
+
+    Kontroluje podpis, `iss`, `aud` a povinné claimy; při úspěchu vrátí
+    dekódované claimy, jinak 401.
+    """
     authorization = request.headers.get("authorization", "")
     if not authorization.lower().startswith("bearer "):
         return JSONResponse({"detail": "Bearer token required"}, status_code=401)
@@ -485,6 +590,7 @@ async def verify_token(request: Request):
 
 @app.get("/fake-health")
 async def fake_health():
+    """Health check pro docker-compose a rychlé ověření, že fake běží."""
     return {
         "ok": True,
         "service": "fake_easy_entra_id",
@@ -495,6 +601,7 @@ async def fake_health():
 
 @app.get("/fake-users")
 async def fake_users():
+    """Vrátí načtené fake uživatele jako JSON (pro debugging a testy)."""
     return {
         "users": load_fake_users(),
     }
@@ -502,6 +609,7 @@ async def fake_users():
 
 @app.get("/login")
 async def fake_login(request: Request):
+    """Zobrazí přihlašovací stránku s výběrem fake uživatele."""
     return HTMLResponse(read_login_template(request))
 
 
@@ -512,6 +620,12 @@ async def fake_select_user(
     user: str = Form(...),
     next: str = Form(default="/"),
 ):
+    """
+    Přihlásí zvoleného fake uživatele a přesměruje na `next`.
+
+    Hodnota `user` může být id, oid, email nebo preferred_username.
+    Neznámý uživatel vrací 400 s chybou v UI.
+    """
     selected_user = find_user(user)
 
     if not selected_user:
@@ -534,6 +648,7 @@ async def fake_select_user(
 
 @app.get("/fake-logout")
 async def fake_logout(request: Request, next: str = "/login"):
+    """Zruší fake session a smaže cookie."""
     forget_cookie_value(request.cookies.get(FAKE_AUTH_COOKIE))
     response = RedirectResponse(next or "/login", status_code=303)
     response.delete_cookie(FAKE_AUTH_COOKIE)
@@ -541,6 +656,7 @@ async def fake_logout(request: Request, next: str = "/login"):
 
 
 def is_pass_through(path: str) -> bool:
+    """True pro cesty, které patří fake aplikaci a nesmí se proxyovat."""
     return any(path.startswith(prefix) for prefix in PASS_THROUGH_PREFIXES)
 
 
@@ -662,6 +778,13 @@ async def proxy_to_target(
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
 async def catch_all(request: Request, path: str):
+    """
+    Catch-all proxy na TARGET_SERVER.
+
+    Bez přihlášeného uživatele přesměruje GET/HEAD na /login a ostatní metody
+    odmítne 401. S uživatelem požadavek proxyuje a zaloguje celkový čas
+    i čas strávený na upstreamu.
+    """
     total_started = time.perf_counter()
     request_path = request.url.path
 
