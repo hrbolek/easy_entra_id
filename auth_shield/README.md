@@ -1,93 +1,292 @@
 # Auth Shield
 
-Transparentní autentizační mezivrstva mezi `easy_entra_id` (EasyAuth), aplikacemi
-a `serverjsonata`. Aplikace nikdy nedostane samotnou Entra identitu — dostane
-krátkodobý opaque handle, který Shield umí přeložit zpět.
+Transparentní autentizační mezivrstva mezi vydavatelem identity
+(`easy_entra_id` / `fake_easy_entra_id`), backend aplikací a skrytým API.
+
+Backend aplikace **nikdy nevidí reálný token**. Shield ho ověří, uloží do
+`TokenVault` a aplikaci předá vlastní **Shield JWT**. Při volání API jde
+request zase přes Shield, který Shield JWT vymění zpět za reálný token.
 
 > ⚠️ `TokenVault` je procesně lokální. Musí běžet **právě jeden** Uvicorn
-> worker, jinak se handle vydaný jedním workerem v jiném nenajde.
+> worker, jinak se token uložený jedním workerem v jiném nenajde.
 
-> 📄 Chystaná změna: varianta, kde Shield vystupuje jako interní STS a vydává
-> ověřitelné JWT, je popsaná v [Návrh: Shield jako interní STS](#návrh-shield-jako-interní-sts).
-> Aktuální kód se podle ní zatím nechová.
+## Topologie
+
+```mermaid
+flowchart LR
+  C[client] --> IDP[fake_easy_entra_id<br/>nebo easy_entra_id]
+  IDP -->|reálný JWT| S[auth_shield]
+  S -->|Shield JWT| BA[backend app]
+  BA -->|Shield JWT| S
+  S -->|reálný JWT| API[skryté API]
+```
+
+| Prvek | Vidí |
+| --- | --- |
+| `fake_easy_entra_id` / `easy_entra_id` | reálný JWT (vydává ho) |
+| `auth_shield` | reálný JWT i Shield JWT |
+| backend app | **jen Shield JWT** |
+| skryté API | reálný JWT |
 
 ## Dva směry provozu
 
 ```text
-Externí směr (klient -> aplikace)
+Ingress (vydavatel -> backend aplikace)
 
   client
-    -> easy_entra_id (EasyAuth)
-    -> auth_shield /{app_id}/{path}
-    -> registrovaná aplikace /{path}
+    -> easy_entra_id / fake_easy_entra_id
+    -> auth_shield /{app_id}/{path}      Authorization: Bearer <reálný JWT>
+    -> aplikace /{path}                  Authorization: Bearer <Shield JWT>
 
-Interní směr (aplikace -> serverjsonata)
+Egress (backend aplikace -> skryté API)
 
   aplikace
-    -> auth_shield /{path}
-    -> serverjsonata /{path}
+    -> auth_shield /{path}               Authorization: Bearer <Shield JWT>
+    -> corridor upstream /{path}         Authorization: Bearer <reálný JWT>
 ```
 
-Směr se určuje **výhradně z hlaviček** requestu, ne z cesty:
+Směr se určuje **výhradně z claimu `iss`** v bearer tokenu:
 
-| Podmínka | Směr |
+| `iss` v tokenu | Směr |
 | --- | --- |
-| `Authorization: Bearer shld_...` | interní (corridor) |
-| `x-ms-client-principal*` | externí (EasyAuth) |
-| obojí současně | 500 – ambiguous contract |
-| ani jedno | 500 – unknown contract |
-
-Neplatný nebo chybějící EasyAuth kontrakt je brán jako chyba infrastruktury
-(gateway), proto 500 a ne 401.
+| `SHIELD_ISSUER` (tento Shield) | egress (corridor) |
+| registrovaný vydavatel z `ISSUERS_JSON` | ingress |
+| neznámý / chybějící token | 500 – unknown contract |
 
 ## Co Shield dělá
 
-### Externí směr
+### Ingress
 
-1. Ověří EasyAuth kontrakt (`x-ms-client-principal` musí být base64 JSON objekt,
-   `principal_id` se bere z hlavičky nebo z claimu `oid`/`sub`).
-2. Rozdělí cestu na `app_id` a zbytek (`/whoami/api/x` → `whoami` + `api/x`).
-3. Ověří, že aplikace existuje, je `enabled` a povoluje danou HTTP metodu.
-4. Uloží principal do `TokenVault` a vydá handle `shld_<32B urlsafe>`.
-5. Přepošle request na `upstream` aplikace s hlavičkami:
+1. Přečte `iss` z tokenu (bez ověření podpisu) a najde odpovídajícího
+   důvěryhodného vydavatele. `iss` mimo registr = 401.
+2. Stáhne klíč z `jwks_uri` vydavatele podle `kid` (cache, refresh při
+   neznámém `kid` s rate limitem).
+3. Ověří podpis, `iss`, `aud`, `exp`, `nbf` (leeway 60 s).
+4. Rozdělí cestu na `app_id` a zbytek (`/backend-app/api/x` → `backend-app`
+   + `api/x`) a ověří registrovanou aplikaci i povolenou metodu.
+5. Uloží **reálný token** do `TokenVault` pod nové `jti`.
+6. Vydá Shield JWT a přepošle request na upstream aplikace.
+
+Backend dostane:
 
 ```text
-Authorization: Bearer shld_...
+Authorization: Bearer <Shield JWT>
 x-shield-app                 app_id
-x-shield-principal-id        oid uživatele
-x-shield-principal-name      e-mail / UPN (pokud je)
-x-shield-expires-in          TTL v sekundách
+x-shield-principal-id        sub (oid uživatele)
+x-shield-expires-in          TTL Shield JWT v sekundách
 x-request-id                 z requestu, jinak vygenerovaný
 ```
 
-### Interní směr
+### Egress
 
-1. Podle handlu dohledá záznam ve vaultu (expirovaný/neznámý → 401).
-2. Ověří aplikaci a povolenou metodu.
-3. Ověří, že cesta spadá do `allowed_corridor_prefixes` (jinak 403).
-4. Obnoví EasyAuth identitní hlavičky vůči `CORRIDOR_UPSTREAM`:
+1. Ověří Shield JWT vlastním klíčem, `iss` proti `SHIELD_ISSUER` a `aud`
+   proti registru aplikací.
+2. Dohledá `jti` ve vaultu (expirovaný/neznámý → 401) a ověří, že `aud`
+   odpovídá `app_id` záznamu.
+3. Ověří povolenou metodu a že cesta spadá do `allowed_corridor_prefixes`
+   (jinak 403).
+4. Přiloží **reálný token** vydavatele na odchozí request.
+
+Corridor upstream dostane:
 
 ```text
-x-ms-client-principal        původní base64 principal
-x-ms-client-principal-id     oid
-x-ms-client-principal-name   e-mail / UPN (pokud je)
+Authorization: Bearer <reálný JWT>
 x-shield-app                 app_id
-x-shield-principal-id        oid
-x-shield-principal-name      e-mail / UPN (pokud je)
-x-shield-token-fingerprint   sha256(principal)[:16]
+x-shield-principal-id        sub
+x-shield-token-fingerprint   sha256(reálný token)[:16]
 x-request-id                 z requestu, jinak vygenerovaný
 ```
+
+## Shield JWT
+
+Shield je pro backend **vydavatel**: podepisuje vlastní RS256 JWT, který si
+backend ověří standardně přes `iss` a JWKS.
+
+```json
+{
+  "iss": "https://auth-shield.dev.internal",
+  "aud": "backend-app",
+  "sub": "<oid>",
+  "azp": "https://auth.dev.company.cz",
+  "roles": ["auditor"],
+  "scp": ["read:profile"],
+  "tid": "<tenant>",
+  "jti": "<uuid>",
+  "iat": 0, "nbf": 0, "exp": 0
+}
+```
+
+| Claim | Význam |
+| --- | --- |
+| `iss` | logická identita Shieldu (`SHIELD_ISSUER`) |
+| `aud` | konkrétní aplikace, nikdy globální hodnota |
+| `sub` | původní uživatel (`oid` z vydavatele) |
+| `azp` | kdo identitu přinesl (`iss` vydavatele) |
+| `roles` / `scp` | autorizace dostupná lokálně bez dotazu |
+| `jti` | klíč do `TokenVault` s reálným tokenem |
+
+Shield JWT **není** použitelný proti skrytému API — to přijímá jen tokeny od
+skutečného vydavatele identity.
+
+## Jak backend ověří Shield JWT
+
+Backend potřebuje **dvě** hodnoty:
+
+| Proměnná | K čemu |
+| --- | --- |
+| `SHIELD_ISSUER` | proti čemu porovná `iss` v tokenu |
+| `SHIELD_JWKS_URL` | odkud si stáhne veřejné klíče |
+
+```python
+expected_iss = os.environ["SHIELD_ISSUER"]
+jwks_url = os.environ["SHIELD_JWKS_URL"]
+
+claims = jwt.decode(
+    token,
+    key=fetch_jwks(jwks_url),      # cache, refresh při neznámém kid
+    algorithms=["RS256"],
+    issuer=expected_iss,           # proti konfiguraci, ne proti tokenu
+    audience="backend-app",
+)
+```
+
+`jwks_uri` **není** místo validace — je to jen adresa, odkud se stáhnou klíče.
+Validace probíhá lokálně v backendu.
+
+## Volba `iss` nezávisle na nasazení
+
+`iss` nesmí být odvozený ze síťové adresy. V docker compose je Shield dostupný
+na `http://auth_shield:8000`, ale tato adresa se mění podle názvu služby,
+portu, prostředí i podle toho, zda je před ním TLS terminátor.
+
+### Co je co
+
+| Co | K čemu slouží | Příklad |
+| --- | --- | --- |
+| `iss` (claim v JWT) | **identita vydavatele** — proti čemu backend porovnává | `https://auth-shield.dev.internal` |
+| `jwks_uri` | **odkud stáhnout veřejné klíče** pro ověření podpisu | `http://auth_shield:8000/.well-known/jwks.json` |
+| `aud` (claim v JWT) | **komu je token určen** | `backend-app` |
+
+Validace samotná probíhá **lokálně v backendu**:
+
+1. Backend přečte `iss` z tokenu a porovná ho s očekávanou hodnotou.
+2. Stáhne klíče z `jwks_uri` (jednou, pak z cache).
+3. Ověří podpis klíčem podle `kid` — lokálně, bez síťového volání.
+4. Ověří `aud`, `exp`, `nbf` — také lokálně.
+
+Síťové volání je tedy jen kvůli klíčům, ne kvůli validaci. Proto se `jwks_uri`
+může měnit mezi nasazeními, aniž by to znamenalo změnu kontraktu.
+
+### `jwks_uri` je trust anchor, ne tajemství
+
+`jwks_uri` není heslo, které by se mělo skrývat; je to **ukazatel důvěry**.
+Kdo ho změní, rozhoduje, kterým klíčům backend uvěří.
+
+| Vlastnost | Secret (heslo, klíč) | Trust anchor (`jwks_uri`) |
+| --- | --- | --- |
+| Má se skrývat? | ano | ne, ale musí být **integritně chráněný** |
+| Kdo ho smí měnit | nikdo mimo správce | jen konfigurace, nikdy request |
+| Co hrozí při zneužití | přímý přístup | podvržené klíče → podvržené tokeny |
+| Odkud se bere | secret store | konfigurace / `.env` |
+
+Klíčový důsledek: **`jwks_uri` se nikdy nesmí vzít z tokenu ani z discovery
+dokumentu, kterému ještě nevěříme.**
+
+### Pravidla pro `jwks_uri`
+
+- **Pevně z konfigurace**, stejně jako `iss`. Nikdy z `Host` ani z tokenu.
+- **HTTPS mimo lokální síť.** `http://auth_shield:8000` je přijatelné jen
+  uvnitř compose sítě.
+- **Ověřit TLS certifikát** — vypnutá verifikace dělá z trust anchoru
+  veřejný bod.
+- **Omezit, kam se smí volat** — jen registrované JWKS adresy (jinak SSRF).
+- **Cache s rozmyslem** — při neznámém `kid` refresh s rate limitem.
+- **Discovery jen jako convenience** — `issuer` porovnat s vlastní hodnotou,
+  `jwks_uri` ignorovat nebo ověřit proti allowlistu.
+
+### Doporučená konvence
+
+```text
+https://auth-shield.<env>.internal
+```
+
+- `<env>` = `dev`, `test`, `prod` — prostředí v názvu brání tomu, aby token
+  z dev prošel v prod i při shodném klíči,
+- bez trailing slash, bez portu, bez cesty,
+- vždy `https://`, i když uvnitř compose jede Shield po HTTP.
+
+### Jediný zdroj pravdy v docker compose
+
+```dotenv
+# trust anchors — verzované, reviewované
+SHIELD_ISSUER=https://auth-shield.dev.internal
+SHIELD_JWKS_URL=http://auth_shield:8000/.well-known/jwks.json
+
+# secrets — necommitovat
+SHIELD_SIGNING_KEY_FILE=/run/secrets/shield-signing-key.pem
+```
+
+```yaml
+services:
+  auth_shield:
+    environment:
+      SHIELD_ISSUER: ${SHIELD_ISSUER}
+      SHIELD_JWKS_BASE_URL: http://auth_shield:8000
+
+  backend_app:
+    environment:
+      SHIELD_ISSUER: ${SHIELD_ISSUER}
+      SHIELD_JWKS_URL: ${SHIELD_JWKS_URL}
+```
+
+`SHIELD_JWKS_BASE_URL` je jen to, co Shield vypíše do discovery dokumentu
+jako `jwks_uri`. Backend ji nepoužívá, ten má vlastní `SHIELD_JWKS_URL`.
+
+### Co nedělat
+
+- **Neodvozovat `iss` z `Host` hlavičky** — issuer confusion.
+- **Nevalidovat token dotazem na `jwks_uri`** — JWKS vydává jen klíče.
+- **Nebrat `jwks_uri` z tokenu ani z nedůvěryhodného discovery dokumentu.**
+- **Nepoužívat `http://auth_shield:8000` jako `iss`.**
+- **Nedávat do `iss` trailing slash** — porovnává se přesná shoda.
+- **Nezaměňovat `iss` a `aud`.**
+- **Nesdílet podpisový klíč mezi prostředími.**
+
+### Co se mění při změně nasazení
+
+| Změna | `iss` | `jwks_uri` |
+| --- | --- | --- |
+| jiný název služby v compose | beze změny | změna |
+| jiný port | beze změny | změna |
+| Shield za TLS ingressem | beze změny | změna |
+| přesun do Kubernetes | beze změny | změna |
+| jiné prostředí (dev → prod) | změna | změna |
+
+### Validace při startu
+
+Shield validuje `SHIELD_ISSUER` a `SHIELD_JWKS_BASE_URL` hned při startu:
+
+- absolutní HTTP(S) URL,
+- bez trailing slash, bez query a fragmentu.
+
+Nevalidní hodnota = pád při startu, ne až 401 za provozu. Hodnota se
+**nenormalizuje** — tiché odstranění trailing slash by mohlo způsobit, že
+Shield a backend porovnávají jiný string.
 
 ## Bezpečnostní pravidla
 
-- `SENSITIVE_HEADERS` (`authorization`, `cookie`, `set-cookie`, `x-ms-token-aad-*`,
-  `x-ms-client-principal*`, `x-shield-*`) se z příchozího requestu **nikdy**
-  nepropouští na upstream — klient je nemůže podstrčit.
-- Hop-by-hop hlavičky (`connection`, `transfer-encoding`, `upgrade`, …) se
-  zahazují v obou směrech.
+- `iss` se nikdy neodvozuje z `Host` hlavičky ani z adresy služby.
+- `jwks_uri` se nikdy nebere z tokenu ani z nedůvěryhodného discovery.
+- `SENSITIVE_HEADERS` (`authorization`, `cookie`, `set-cookie`,
+  `x-ms-token-aad-*`, `x-ms-client-principal*`, `x-shield-*`) se z příchozího
+  requestu **nikdy** nepropouští na upstream.
+- Hop-by-hop hlavičky se zahazují v obou směrech.
 - `Host` se přepisuje na host upstreamu.
 - `Set-Cookie` z upstreamu se do odpovědi nepropouští.
 - Odpověď se streamuje a hlídá se `MAX_RESPONSE_BYTES`.
+- `Authorization` nikdy do logů; loguje se jen `jti`, `iss` a `azp`.
+- Reálný token se z vaultu nikdy nevrací klientovi ani aplikaci — jen se
+  přiloží na odchozí request.
 - `docs_url`/`redoc_url` jsou vypnuté.
 
 ## Konfigurace
@@ -95,8 +294,15 @@ x-request-id                 z requestu, jinak vygenerovaný
 | Proměnná | Default | Význam |
 | --- | --- | --- |
 | `APPLICATIONS_JSON` | — (**povinné**) | Registr aplikací |
-| `CORRIDOR_UPSTREAM` | `http://serverjsonata:3000` | Cíl interního směru |
-| `TOKEN_TTL_SECONDS` | `300` | Platnost handlu |
+| `ISSUERS_JSON` | prázdné | Důvěryhodní vydavatelé pro ingress |
+| `CORRIDOR_UPSTREAM` | `http://serverjsonata:3000` | Cíl egress směru |
+| `SHIELD_ISSUER` | `https://auth-shield.internal` | Logická identita Shieldu |
+| `SHIELD_JWKS_BASE_URL` | `http://auth_shield:8000` | Základ pro publikované `jwks_uri` |
+| `SHIELD_SIGNING_KEY_FILE` | `/tmp/auth-shield/signing-key.pem` | Perzistentní RSA klíč |
+| `SHIELD_KEY_ID` | `auth-shield-1` | `kid` v JWKS i v hlavičce tokenu |
+| `SHIELD_TOKEN_LIFETIME_SECONDS` | `300` | Platnost Shield JWT (1–86400) |
+| `SHIELD_TOKEN_SINGLE_USE` | `false` | Smazat vault záznam při prvním egress použití |
+| `TOKEN_TTL_SECONDS` | `300` | Max. životnost vault záznamu |
 | `MAX_TOKEN_ENTRIES` | `10000` | Max. záznamů ve vaultu |
 | `REQUEST_TIMEOUT_SECONDS` | `60` | Timeout na upstream |
 | `MAX_RESPONSE_BYTES` | `52428800` (50 MiB) | Limit streamované odpovědi |
@@ -106,16 +312,11 @@ x-request-id                 z requestu, jinak vygenerovaný
 
 ```json
 {
-  "whoami": {
-    "upstream": "http://whoami",
+  "backend-app": {
+    "upstream": "http://backend-app:8000",
     "enabled": true,
     "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    "allowed_corridor_prefixes": ["/graphql"]
-  },
-  "graphql": {
-    "upstream": "http://serverjsonata:3000/graphql",
-    "allowed_methods": ["POST"],
-    "allowed_corridor_prefixes": ["/graphql"]
+    "allowed_corridor_prefixes": ["/api"]
   }
 }
 ```
@@ -130,12 +331,39 @@ x-request-id                 z requestu, jinak vygenerovaný
 Validace je striktní: neznámá metoda, neabsolutní prefix, prázdný `upstream`
 nebo prázdný registr shodí start aplikace s `RuntimeError`.
 
+### `ISSUERS_JSON`
+
+```json
+{
+  "fake": {
+    "issuer": "https://auth.dev.company.cz",
+    "jwks_uri": "http://easy-entra-fake:8000/.well-known/jwks.json",
+    "audience": ["internal-api"]
+  },
+  "entra": {
+    "issuer": "https://login.microsoftonline.com/<tenant>/v2.0",
+    "jwks_uri": "https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys",
+    "audience": ["api://easy-entra-id"]
+  }
+}
+```
+
+| Pole | Povinné | Význam |
+| --- | --- | --- |
+| `issuer` | ano | přesná shoda s claimem `iss` |
+| `jwks_uri` | ano | trust anchor pro veřejné klíče |
+| `audience` | ne | povolené hodnoty `aud`; prázdné = neověřovat |
+
+Prázdné `ISSUERS_JSON` znamená, že ingress validace JWT není zapnutá.
+
 ## Endpointy
 
 | Metoda | Cesta | Popis |
 | --- | --- | --- |
-| `GET` | `/health` | `ok`, seznam aplikací, počet záznamů ve vaultu |
-| `*` | `/{path}` | Catch-all proxy (externí i interní směr) |
+| `GET` | `/health` | `ok`, `issuer`, aplikace, vydavatelé, počet záznamů ve vaultu |
+| `GET` | `/.well-known/openid-configuration` | `issuer` + `jwks_uri` pro backend |
+| `GET` | `/.well-known/jwks.json` | Veřejné klíče Shieldu (`kid`) |
+| `*` | `/{path}` | Catch-all proxy (ingress i egress) |
 
 ## Spuštění
 
@@ -159,17 +387,21 @@ docker compose -f docker-compose.fake-shield.ext.yaml up --build
 ```bash
 pip install -r auth_shield/requirements.txt
 
-export APPLICATIONS_JSON='{"whoami":{"upstream":"http://localhost:8080"}}'
+export APPLICATIONS_JSON='{"backend-app":{"upstream":"http://localhost:8080","allowed_corridor_prefixes":["/api"]}}'
+export ISSUERS_JSON='{"fake":{"issuer":"https://auth.dev.company.cz","jwks_uri":"http://localhost:8000/.well-known/jwks.json","audience":["internal-api"]}}'
+export SHIELD_ISSUER='https://auth-shield.dev.internal'
+export SHIELD_JWKS_BASE_URL='http://localhost:8090'
 export CORRIDOR_UPSTREAM='http://localhost:3000'
 
-uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir auth_shield
+uvicorn main:app --host 0.0.0.0 --port 8090 --app-dir auth_shield
 ```
 
 ### Z publikované image
 
 ```bash
 docker run --rm -p 8090:8000 \
-  -e APPLICATIONS_JSON='{"whoami":{"upstream":"http://whoami"}}' \
+  -e APPLICATIONS_JSON='{"backend-app":{"upstream":"http://backend-app:8000"}}' \
+  -e SHIELD_ISSUER='https://auth-shield.dev.internal' \
   ghcr.io/hrbolek/easy_entra_id-auth-shield:latest
 ```
 
@@ -179,145 +411,31 @@ docker run --rm -p 8090:8000 \
 # health
 curl http://localhost:8090/health
 
-# externí směr: EasyAuth principal (base64 JSON)
-PRINCIPAL=$(printf '%s' '{"auth_typ":"aad","claims":[{"typ":"oid","val":"abc-123"}]}' | base64 -w0)
-curl -i http://localhost:8090/whoami/api \
-  -H "x-ms-client-principal: $PRINCIPAL" \
-  -H "x-ms-client-principal-id: abc-123"
+# discovery + JWKS
+curl http://localhost:8090/.well-known/openid-configuration
+curl http://localhost:8090/.well-known/jwks.json
 
-# interní směr: neplatný handle -> 401
-curl -i http://localhost:8090/graphql -H "Authorization: Bearer shld_bogus"
+# ingress: reálný JWT od fake IdP
+curl -i http://localhost:8090/backend-app/api/x \
+  -H "Authorization: Bearer <reálný JWT>"
 
-# bez identity -> 500 (unknown contract)
-curl -i http://localhost:8090/whoami/api
+# egress: Shield JWT vrácený backendu
+curl -i http://localhost:8090/api/y \
+  -H "Authorization: Bearer <Shield JWT>"
+
+# bez tokenu -> 500 (unknown contract)
+curl -i http://localhost:8090/backend-app/api/x
 ```
 
 ## Omezení
 
 - `TokenVault` je v paměti procesu → jeden worker, žádné sdílení mezi
   replikami; pro HA je potřeba Redis/Valkey.
-- Handle nelze obnovit po restartu procesu (uživatel musí projít znovu
-  přes EasyAuth).
+- Po restartu procesu se vault ztratí, takže Shield JWT z předchozího běhu
+  už nelze vyměnit (uživatel musí projít znovu přes vydavatele).
+- Podpisový klíč se ukládá do `SHIELD_SIGNING_KEY_FILE`, takže Shield JWT
+  přežijí restart jen s perzistentním volume.
 - `Set-Cookie` se nepropouští, takže Shield není vhodný pro aplikace, které
   staví session na cookies z upstreamu.
-- Není to OIDC server — Shield jen konzumuje EasyAuth kontrakt.
-
----
-
-## Návrh: Shield jako interní STS
-
-> **Stav: návrh, neimplementováno.** Tato sekce popisuje cílový stav. Aktuální
-> kód v `main.py` používá opaque handle a `TokenVault` popsaný výše.
-
-### Motivace
-
-Opaque handle má tři slabiny:
-
-1. **Validace jen dotazem do vaultu** — každý request znamená lookup, takže
-   Shield nemůže běžet ve více replikách a je to SPOF.
-2. **Nestandardní kontrakt** — aplikace musí umět `shld_...`, nemůže použít
-   hotový JWT middleware.
-3. **Autorizace až za proxy** — `roles`/`scp` nejsou v ruce volajícího, takže
-   se rozhoduje jen podle `x-shield-*` hlaviček.
-
-Cílový stav: Shield je **interní STS** (security token service). Vydává
-standardní RS256 JWT, které si každý člen kapsle ověří sám přes JWKS.
-
-### Klíčové rozhodnutí: symetrická hranice kapsle
-
-Kapsle = množina služeb za `auth_shield`. Na **obou** hranicích se mluví JWT:
-
-```mermaid
-flowchart LR
-  C[client] --> E[easy_entra_id<br/>EasyAuth]
-  E -->|principal| S[auth_shield<br/>interní STS]
-  S -->|JWT aud=app| A[aplikace]
-  A -->|JWT aud=next| S
-  S -->|JWT aud=next| B[další prvek kapsle]
-  A -->|JWT| S2[auth_shield<br/>hraniční bod]
-  S2 -->|JWT| X[externí systém]
-```
-
-- **Dovnitř** — Shield ověří EasyAuth principal a vydá JWT pro cílovou aplikaci.
-- **Uvnitř** — aplikace volá další prvek kapsle s JWT; Shield ho ověří a vydá
-  **nový** JWT s `aud` cíle.
-- **Ven** — volající pošle JWT, Shield ho ověří a předá dál JWT (ne původní
-  Entra token).
-
-### Proč se nevrací původní Entra token
-
-Výměna JWT zpět za původní Entra access token je **token passthrough** a je to
-anti-pattern:
-
-- příjemce nemá jak poznat, pro koho byl token vydán (audience confusion),
-- token uniklý z jedné služby jde zneužít v celé kapsli i mimo ni,
-- Shield by musel držet reálné credentials v paměti a řešit jejich refresh.
-
-Symetrická hranice (JWT dovnitř, JWT ven) tento problém nemá: každý token má
-jednoznačný `aud` a krátkou platnost. Pokud externí systém vyžaduje Entra token,
-patří to do samostatného adaptéru s OBO flow, ne do proxy.
-
-### Formát tokenu
-
-```json
-{
-  "iss": "https://shield.internal",
-  "aud": "whoami",
-  "sub": "<oid>",
-  "azp": "graphql",
-  "act": { "sub": "<oid>" },
-  "roles": ["auditor"],
-  "scp": ["read:profile"],
-  "tid": "<tenant>",
-  "jti": "<uuid>",
-  "iat": 0, "nbf": 0, "exp": 0
-}
-```
-
-| Claim | Význam |
-| --- | --- |
-| `aud` | **Vždy** konkrétní cíl, nikdy globální hodnota |
-| `azp` | Kdo token požádal (volající prvek kapsle) |
-| `act` | Původní subjekt při delegaci (RFC 8693) |
-| `roles` / `scp` | Autorizace dostupná lokálně bez dotazu |
-| `jti` | Identifikátor pro logování a případný denylist |
-
-### Endpointy
-
-| Metoda | Cesta | Popis |
-| --- | --- | --- |
-| `GET` | `/.well-known/openid-configuration` | Discovery (`jwks_uri`, `issuer`) |
-| `GET` | `/.well-known/jwks.json` | Veřejné klíče, `kid` + rotace |
-| `POST` | `/auth/exchange` | Výměna JWT za JWT s jiným `aud` (RFC 8693) |
-| `GET` | `/health` | Stav, seznam aplikací, `kid` v rotaci |
-
-### Bezpečnostní pravidla
-
-- `aud` vždy konkrétní cíl; token pro `whoami` nesmí projít do `graphql`.
-- TTL 60–300 s, žádné refresh tokeny uvnitř kapsle.
-- Rotace klíčů: nový `kid` se publikuje dřív, starý zůstává v JWKS po dobu
-  overlapu (min. 2× TTL).
-- Privátní klíč přes secret/volume, aby všechny repliky validovaly stejně.
-- `/auth/exchange` musí být vázaný na volajícího (mTLS, network policy nebo
-  per-app secret) — samotný JWT k výměně nestačí.
-- `Authorization` nikdy do logů, logovat jen `jti` a `azp`.
-- Clock skew 30–60 s.
-
-### Dopad na dnešní kód
-
-| Prvek | Dnes | Po změně |
-| --- | --- | --- |
-| `TokenVault` | nutný pro každý request | není potřeba pro interní hop |
-| Počet workerů | právě 1 | libovolný (validace je lokální) |
-| `x-shield-*` hlavičky | nositel identity | jen doplňkové, identita je v JWT |
-| `SENSITIVE_HEADERS` | zahazuje `authorization` | `authorization` se ověřuje, ne zahazuje |
-
-### Migrace
-
-1. `SHIELD_TOKEN_MODE=handle|jwt|both` — handle zůstane pro zpětnou
-   kompatibilitu.
-2. Aplikace přejdou na lokální validaci JWT přes JWKS.
-3. Handle se vypustí; `TokenVault` zůstane jen pro externí adaptér s OBO.
-
-`fake` už dnes umí RS256, JWKS i discovery, takže slouží jako testovací IdP
-a obě služby zůstanou symetrické.
+- Shield není OIDC server — nevydává tokeny koncovým uživatelům, jen
+  zprostředkovává identitu mezi vydavatelem, aplikací a API.

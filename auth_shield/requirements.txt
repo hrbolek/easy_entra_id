@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 httpx
 python-multipart
+PyJWT[crypto]>=2.8,<3
