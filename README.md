@@ -172,6 +172,25 @@ ghcr.io/hrbolek/easy_entra_id:v0.1.0
 
 Konfigurace, endpointy a příklady spuštění jsou v [fake/README.md](./fake/README.md).
 
+---
+
+# auth_shield
+
+`auth_shield` je transparentní autentizační mezivrstva mezi `easy_entra_id`,
+aplikacemi a `serverjsonata`. Aplikace dostává místo Entra identity krátkodobý
+opaque handle `shld_...`, který Shield překládá zpět na EasyAuth principal.
+
+Image se publikuje jako:
+
+```text
+ghcr.io/hrbolek/easy_entra_id-auth-shield
+```
+
+Build context je `./auth_shield`, Dockerfile `./auth_shield/Dockerfile`.
+
+Konfigurace, oba směry provozu a příklady spuštění jsou v
+[auth_shield/README.md](./auth_shield/README.md).
+
 Image je publikována do GitHub Container Registry jako samostatná image:
 
 ```text

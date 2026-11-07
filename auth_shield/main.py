@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Auth Shield
 
@@ -16,9 +14,10 @@ External direction:
       -> Auth Shield /{app_id}/{path}
       -> registered application /{path}
 
-The request must contain a valid EasyAuth header contract. The real Entra
-access token is stored only in the in-memory TokenVault. The application
-receives a short-lived opaque Shield handle instead:
+The request must contain a valid EasyAuth header contract. The EasyAuth
+principal (the base64 `x-ms-client-principal` payload) is kept only in the
+in-memory TokenVault. The application receives a short-lived opaque Shield
+handle instead:
 
     Authorization: Bearer shld_...
 
@@ -29,16 +28,35 @@ Internal direction:
       -> serverjsonata /{path}
 
 The application sends the Shield handle in Authorization. Auth Shield resolves
-the handle, restores the original Entra access token, and forwards the request
-to serverjsonata.
+the handle, restores the original EasyAuth principal headers, and forwards the
+request to serverjsonata.
 
 A single FastAPI application and a single catch-all route are used. The
 direction is determined solely from the request headers.
+
+Endpoints
+=========
+
+    GET /health     liveness, registered applications and vault size
+    *   /{path}     catch-all proxy (external or internal direction)
+
+Configuration
+=============
+
+    APPLICATIONS_JSON        required; app_id -> upstream/methods/prefixes
+    CORRIDOR_UPSTREAM        default http://serverjsonata:3000
+    TOKEN_TTL_SECONDS        default 300
+    MAX_TOKEN_ENTRIES        default 10000
+    REQUEST_TIMEOUT_SECONDS  default 60
+    MAX_RESPONSE_BYTES       default 50 MiB
+    LOG_LEVEL                default INFO
 
 IMPORTANT:
     TokenVault is process-local. Run exactly one Uvicorn worker unless the
     vault is replaced by a shared store such as Redis/Valkey.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -74,6 +92,7 @@ class ShieldSettings:
 
     @classmethod
     def from_env(cls) -> "ShieldSettings":
+        """Načte konfiguraci z prostředí a doplní defaulty."""
         return cls(
             corridor_upstream=os.getenv(
                 "CORRIDOR_UPSTREAM",
@@ -309,6 +328,14 @@ class VaultEntry:
 
 
 class TokenVault:
+    """
+    Procesně lokální úložiště EasyAuth principalů pod krátkodobými handly.
+
+    Handle (`shld_...`) je opaque náhodný token, který aplikace dostane místo
+    identity. Vault drží jen principal, app_id, expiraci a fingerprint, takže
+    se do aplikace nikdy nedostane samotná Entra identita v otevřené podobě.
+    """
+
     def __init__(self, ttl_seconds: int, max_entries: int) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
@@ -323,6 +350,12 @@ class TokenVault:
         principal_id: str,
         principal_name: str | None,
     ) -> str:
+        """
+        Vydá nový handle pro principal a uloží odpovídající záznam.
+
+        Před vložením pročistí expirované záznamy; při překročení
+        `max_entries` zahodí záznam s nejbližší expirací.
+        """
         handle = SHIELD_TOKEN_PREFIX + secrets.token_urlsafe(32)
         now = time.monotonic()
 
@@ -352,6 +385,7 @@ class TokenVault:
         return handle
 
     async def resolve(self, handle: str) -> VaultEntry | None:
+        """Vrátí záznam pro handle, nebo None když expiroval / neexistuje."""
         now = time.monotonic()
 
         async with self._lock:
@@ -359,6 +393,7 @@ class TokenVault:
             return self._entries.get(handle)
 
     async def count(self) -> int:
+        """Počet platných (neexpirovaných) záznamů ve vaultu."""
         async with self._lock:
             self._purge(time.monotonic())
             return len(self._entries)
@@ -387,6 +422,12 @@ class AppState:
 
 
 def runtime_state(request: Request) -> AppState:
+    """
+    Vrátí inicializovaný runtime stav aplikace.
+
+    Když lifespan neproběhl (nebo se stav nepodařilo vytvořit), vrací 500,
+    protože bez vaultu a registru aplikací nemá smysl pokračovat.
+    """
     runtime = getattr(request.app.state, "runtime", None)
 
     if not isinstance(runtime, AppState):
@@ -412,6 +453,11 @@ class EasyAuthIdentity:
 
 
 def bearer(value: str | None) -> str | None:
+    """
+    Vytáhne token z `Authorization: Bearer <token>`.
+
+    Vrací None pro chybějící hlavičku, jiné schéma i prázdný token.
+    """
     if not value:
         return None
 
@@ -427,6 +473,12 @@ def bearer(value: str | None) -> str | None:
 
 
 def decode_client_principal(value: str | None) -> dict | None:
+    """
+    Dekóduje base64 `x-ms-client-principal` na dict.
+
+    Chybějící padding se doplní; cokoli, co není validní base64 JSON objekt,
+    vrací None (volající to bere jako porušení kontraktu).
+    """
     if not value:
         return None
 
@@ -444,6 +496,12 @@ def claim_from_client_principal(
     principal: dict | None,
     *claim_types: str,
 ) -> str | None:
+    """
+    Najde první claim z `claims` podle seznamu možných názvů.
+
+    Názvy se porovnávají case-insensitive a podporují `typ`/`type`/`claim`
+    i `val`/`value`, aby fungovaly různé varianty EasyAuth payloadu.
+    """
     if not principal:
         return None
 
@@ -475,6 +533,7 @@ def claim_from_client_principal(
 
 
 def has_easyauth_markers(request: Request) -> bool:
+    """True, když request nese alespoň jednu EasyAuth identitní hlavičku."""
     return any(
         request.headers.get(header)
         for header in EASYAUTH_MARKER_HEADERS
@@ -574,6 +633,7 @@ def extract_easyauth_identity(request: Request) -> EasyAuthIdentity:
 
 
 def target_url(base: str, path: str, query: str) -> str:
+    """Sestaví cílovou URL z base, cesty a query stringu."""
     suffix = "/" + path.lstrip("/") if path else ""
     return f"{base}{suffix}" + (f"?{query}" if query else "")
 
@@ -582,6 +642,12 @@ def safe_headers(
     headers: Iterable[tuple[str, str]],
     target_host: str,
 ) -> dict[str, str]:
+    """
+    Vyfiltruje hlavičky bezpečné pro přeposlání na upstream.
+
+    Zahazuje hop-by-hop hlavičky, citlivé identitní hlavičky (SENSITIVE_HEADERS)
+    a `Host`; ten nahradí `target_host`, aby odpovídal cíli.
+    """
     output: dict[str, str] = {}
 
     for name, value in headers:
@@ -604,6 +670,11 @@ def path_allowed(
     path: str,
     prefixes: tuple[str, ...],
 ) -> bool:
+    """
+    Ověří, že cesta spadá pod některý z povolených prefixů.
+
+    Porovnává se po hranici segmentu, takže `/graphql` nepustí `/graphqlx`.
+    """
     normalized = "/" + path.lstrip("/")
 
     return any(
@@ -617,6 +688,7 @@ def registered_application(
     state: AppState,
     app_id: str,
 ) -> ApplicationRegistration:
+    """Vrátí registraci aplikace; neznámá nebo vypnutá aplikace je 404."""
     registration = state.applications.get(app_id)
 
     if registration is None or not registration.enabled:
@@ -629,6 +701,7 @@ def registered_application(
 
 
 async def request_body(request: Request) -> AsyncIterator[bytes]:
+    """Streamuje tělo příchozího requestu po chuncích (bez bufferování)."""
     async for chunk in request.stream():
         if chunk:
             yield chunk
@@ -641,6 +714,13 @@ async def forward(
     path: str,
     headers: dict[str, str],
 ) -> Response:
+    """
+    Provede samotné proxy volání na upstream a vrátí odpověď.
+
+    Tělo requestu se streamuje (kromě GET/HEAD), odpověď se streamuje také
+    a hlídá se limit `MAX_RESPONSE_BYTES`. Hop-by-hop a `Content-Length`
+    hlavičky se z odpovědi zahazují, `Set-Cookie` se nepropouští.
+    """
     state = runtime_state(request)
 
     outbound = state.http.build_request(
@@ -715,6 +795,11 @@ async def forward(
 
 
 def split_application_path(path: str) -> tuple[str, str]:
+    """
+    Rozdělí externí cestu na `app_id` a zbytek cesty pro aplikaci.
+
+    `/whoami/api/x` -> ("whoami", "api/x"). Prázdná cesta je chyba kontraktu.
+    """
     normalized = path.strip("/")
 
     if not normalized:
@@ -734,6 +819,13 @@ async def handle_external_request(
     path: str,
     state: AppState,
 ) -> Response:
+    """
+    Zpracuje požadavek přicházející z EasyEntraID (externí směr).
+
+    Ověří EasyAuth kontrakt, najde registrovanou aplikaci podle `app_id`,
+    zkontroluje povolenou metodu, uloží principal do vaultu a přepošle
+    požadavek na upstream aplikace s krátkodobým Shield handlem.
+    """
     identity = extract_easyauth_identity(request)
 
     app_id, application_path = split_application_path(path)
@@ -786,6 +878,13 @@ async def handle_internal_request(
     state: AppState,
     handle: str,
 ) -> Response:
+    """
+    Zpracuje požadavek z aplikace (interní směr, corridor).
+
+    Podle handlu dohledá principal ve vaultu, ověří, že aplikace smí danou
+    metodu a že cesta spadá do povolených corridor prefixů, a teprve pak
+    obnoví EasyAuth identitní hlavičky vůči serverjsonata.
+    """
     entry = await state.vault.resolve(handle)
 
     if entry is None:
@@ -850,6 +949,12 @@ async def handle_internal_request(
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """
+    Inicializuje runtime stav: settings, HTTP klient, vault a registr aplikací.
+
+    Registr se čte z `APPLICATIONS_JSON`; nevalidní konfigurace shodí start,
+    aby se aplikace nespustila v polovině nakonfigurovaném stavu.
+    """
     settings = ShieldSettings.from_env()
 
     async with httpx.AsyncClient(
@@ -897,6 +1002,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health(request: Request) -> dict:
+    """Liveness endpoint: vrací registrované aplikace a počet záznamů ve vaultu."""
     state = runtime_state(request)
 
     return {
